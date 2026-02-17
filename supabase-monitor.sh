@@ -2,10 +2,10 @@
 # Script wrapper per eseguire il monitor Supabase con le variabili di ambiente corrette
 
 # Carica le variabili di ambiente
-if [ -f "/home/docker/.env.supabase-monitor" ]; then
-    source /home/docker/.env.supabase-monitor
+if [ -f ".env.supabase-monitor" ]; then
+    source .env.supabase-monitor
 else
-    echo "✗ File di configurazione non trovato: /home/docker/.env.supabase-monitor"
+    echo "✗ File di configurazione non trovato: .env.supabase-monitor"
     exit 1
 fi
 
@@ -17,7 +17,7 @@ fi
 
 # Esegui lo script Python con logging
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Avvio monitoraggio Supabase" >> "$LOG_FILE"
-/usr/bin/python3 /home/docker/supabase_monitor.py >> "$LOG_FILE" 2>&1
+/usr/bin/python3 ./supabase_monitor.py >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Fine monitoraggio (exit code: $EXIT_CODE)" >> "$LOG_FILE"
 

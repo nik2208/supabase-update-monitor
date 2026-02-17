@@ -1,177 +1,280 @@
-#!/usr/bin/env python3
+def _load_local_compose(self):
+        """Carica i docker-compose.yml e .env locali"""
+        print(f"\n[{datetime.now()}] Caricando file locali...")
+
+        with open(COMPOSE_FILE) as f:
+            self.local_compose = f.read()
+        print(f"  ✓ {COMPOSE_FILE}")
+
+        if COMPOSE_S3_FILE and os.path.exists(COMPOSE_S3_FILE):
+            with open(COMPOSE_S3_FILE) as f:
+                self.local_compose_s3 = f.read()
+            print(f"  ✓ {COMPOSE_S3_FILE}")
+
+        # Carica il file .env locale
+        if os.path.exists(ENV_FILE):
+            with open(ENV_FILE) as f:
+                self.local_env = f.read()
+            print(f"  ✓ {ENV_FILE}")
+        else:
+            print(f"  ⚠️  .env locale non trovato in {ENV_FILE}")#!/usr/bin/env python3
 """
-Supabase Self-Hosted Update Monitor - VERSIONE MIGLIORATA
-Monitors Docker image versions, checks changelogs, uses LiteLLM for AI analysis,
-and sends email notifications.
+Supabase Self-Hosted Update Monitor - v2
+Confronta docker-compose.yml locali con quelli del repo GitHub ufficiale
+Scarica il changelog e invia tutto ad AI per analisi
 """
 
 import os
 import json
 import re
 import sys
+import difflib
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Optional, Tuple
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import requests
 from pathlib import Path
 
-# Configurazione
+# === CONFIGURAZIONE ===
+# File locali
 COMPOSE_FILE = os.getenv("COMPOSE_FILE", "/home/docker/dockerCompose/supabase/supatest/docker-compose.yml")
+COMPOSE_S3_FILE = os.getenv("COMPOSE_S3_FILE", "/home/docker/dockerCompose/supabase/supatest/docker-compose.s3.yml")
+ENV_FILE = os.getenv("ENV_FILE", "/home/docker/dockerCompose/supabase/supatest/.env")
+
+# GitHub URLs
+GITHUB_COMPOSE_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/docker-compose.yml"
+GITHUB_COMPOSE_S3_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/docker-compose.s3.yml"
+CHANGELOG_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/CHANGELOG.md"
+GITHUB_ENV_EXAMPLE_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/.env.example"
+
+# LiteLLM
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://localhost:4000")
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
-LITELLM_MODEL = os.getenv("LITELLM_MODEL", "gpt-3.5-turbo")
+LITELLM_MODEL = os.getenv("LITELLM_MODEL", "groq/llama-3.3-70b-versatile")
 
+# SMTP
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
-# FIX 1: Parsing corretto di MAIL_TO
 MAIL_TO = [x.strip() for x in os.getenv("MAIL_TO", "").split(",") if x.strip()]
 
-STATE_FILE = "/tmp/supabase_versions.json"
+# State e log
+STATE_FILE = "/tmp/supabase_comparison.json"
 LOG_FILE = os.getenv("LOG_FILE", "/var/log/supabase-monitor.log")
+CHANGELOG_EXTRACT_SIZE = 100
 
 
 class SupabaseMonitor:
     def __init__(self):
-        self.current_versions = {}
-        self.new_versions = {}
-        self.changelogs = {}
+        self.local_compose = ""
+        self.local_compose_s3 = ""
+        self.github_compose = ""
+        self.github_compose_s3 = ""
+        self.local_env = ""
+        self.github_env_example = ""
+        self.compose_diff = ""
+        self.compose_s3_diff = ""
+        self.env_diff = ""
+        self.changelog_excerpt = ""
         self.ai_analysis = None
         self.errors = []
-        
-        # Validazione configurazione
+        self.has_changes = False
+
         self._validate_config()
-        self._load_current_versions()
 
     def _validate_config(self):
         """Valida la configurazione prima di iniziare"""
         print(f"\n[{datetime.now()}] Validando configurazione...")
-        
+
         if not os.path.exists(COMPOSE_FILE):
             raise FileNotFoundError(f"docker-compose.yml non trovato: {COMPOSE_FILE}")
-        
+
+        if COMPOSE_S3_FILE and not os.path.exists(COMPOSE_S3_FILE):
+            print(f"  ⚠️  docker-compose.s3.yml non trovato: {COMPOSE_S3_FILE}")
+
         if not LITELLM_API_KEY:
-            self.errors.append("⚠️  LITELLM_API_KEY non configurato - analisi AI non sarà disponibile")
-        
+            self.errors.append("⚠️  LITELLM_API_KEY non configurato")
+
         if not SMTP_USER or not SMTP_PASSWORD:
-            self.errors.append("⚠️  Credenziali SMTP non configurate - email non sarà inviata")
-        
+            self.errors.append("⚠️  Credenziali SMTP non configurate")
+
         if not MAIL_TO:
-            self.errors.append("⚠️  MAIL_TO non configurato - email non sarà inviata")
-        
+            self.errors.append("⚠️  MAIL_TO non configurato")
+
         print(f"  ✓ Configurazione validata")
 
-    def _load_current_versions(self) -> Dict[str, str]:
-        """Legge le versioni attuali da docker-compose.yml"""
-        print(f"[{datetime.now()}] Caricando versioni attuali...")
-        
+    def _load_local_compose(self):
+        """Carica i docker-compose.yml locali"""
+        print(f"\n[{datetime.now()}] Caricando file locali...")
+
         with open(COMPOSE_FILE) as f:
-            content = f.read()
+            self.local_compose = f.read()
+        print(f"  ✓ {COMPOSE_FILE}")
 
-        # Pattern per immagini Docker (es: postgres:15.1, supabase/postgres:15.1)
-        pattern = r'image:\s*([^:]+):([^\s\n]+)'
-        matches = re.findall(pattern, content)
+        if COMPOSE_S3_FILE and os.path.exists(COMPOSE_S3_FILE):
+            with open(COMPOSE_S3_FILE) as f:
+                self.local_compose_s3 = f.read()
+            print(f"  ✓ {COMPOSE_S3_FILE}")
 
-        if not matches:
-            raise ValueError(f"Nessuna immagine Docker trovata in {COMPOSE_FILE}")
+    def _fetch_github_compose(self):
+        """Scarica i docker-compose.yml e .env.example dal repo GitHub"""
+        print(f"\n[{datetime.now()}] Scaricando file da GitHub...")
 
-        for service, version in matches:
-            service_name = service.split('/')[-1]
-            self.current_versions[service_name] = version
-            print(f"  • {service_name}: {version}")
-
-        return self.current_versions
-
-    def _get_docker_hub_url(self, service: str) -> str:
-        """Costruisce l'URL corretto per Docker Hub API"""
-        # Se il servizio non ha '/', è un'immagine ufficiale
-        if '/' not in service:
-            return f"https://hub.docker.com/v2/repositories/library/{service}/tags"
-        else:
-            return f"https://hub.docker.com/v2/repositories/{service}/tags"
-
-    def check_new_versions(self) -> bool:
-        """Controlla le nuove versioni disponibili su Docker Hub"""
-        print(f"\n[{datetime.now()}] Controllando nuove versioni...")
-
-        has_updates = False
-        for service, current_version in self.current_versions.items():
-            try:
-                # FIX 2: URL corretto per Docker Hub API
-                url = self._get_docker_hub_url(service)
-                resp = requests.get(url, timeout=10)
-                
-                if resp.status_code == 200:
-                    tags = resp.json().get('results', [])
-                    if tags:
-                        latest_tag = tags[0]['name']
-                        if latest_tag != current_version:
-                            self.new_versions[service] = {
-                                'current': current_version,
-                                'new': latest_tag
-                            }
-                            has_updates = True
-                            print(f"  ✓ {service}: {current_version} → {latest_tag}")
-                elif resp.status_code == 404:
-                    print(f"  ⚠️  {service}: non trovato su Docker Hub")
-                else:
-                    print(f"  ✗ {service}: errore HTTP {resp.status_code}")
-            except Exception as e:
-                msg = f"Errore controllando {service}: {e}"
-                print(f"  ✗ {msg}")
-                self.errors.append(msg)
-
-        return has_updates
-
-    def fetch_changelog(self, service: str, version: str) -> str:
-        """Scarica il changelog per un servizio"""
         try:
-            # Prova a scaricare dal repository GitHub ufficiale
-            url = f"https://raw.githubusercontent.com/supabase/supabase/v{version}/CHANGELOG.md"
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(GITHUB_COMPOSE_URL, timeout=10)
+            resp.raise_for_status()
+            self.github_compose = resp.text
+            print(f"  ✓ docker-compose.yml")
+        except Exception as e:
+            msg = f"Errore scaricando docker-compose.yml: {e}"
+            print(f"  ✗ {msg}")
+            self.errors.append(msg)
+            return False
 
-            if resp.status_code == 200:
-                return resp.text[:2000]
+        try:
+            resp = requests.get(GITHUB_COMPOSE_S3_URL, timeout=10)
+            resp.raise_for_status()
+            self.github_compose_s3 = resp.text
+            print(f"  ✓ docker-compose.s3.yml")
+        except Exception as e:
+            print(f"  ⚠️  Errore scaricando docker-compose.s3.yml: {e}")
 
-            # Alternativa: usa Docker Hub API per la descrizione
-            url = f"https://hub.docker.com/v2/repositories/{service}/tags/{version}"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                return json.dumps(resp.json(), indent=2)[:1000]
+        try:
+            resp = requests.get(GITHUB_ENV_EXAMPLE_URL, timeout=10)
+            resp.raise_for_status()
+            self.github_env_example = resp.text
+            print(f"  ✓ .env.example")
+        except Exception as e:
+            print(f"  ⚠️  Errore scaricando .env.example: {e}")
+
+        return True
+
+    def _generate_diff(self, local: str, github: str, filename: str) -> str:
+        """Genera un diff leggibile tra i due file"""
+        local_lines = local.splitlines(keepends=True)
+        github_lines = github.splitlines(keepends=True)
+
+        # Usa unified diff
+        diff = difflib.unified_diff(
+            local_lines,
+            github_lines,
+            fromfile=f"locale ({filename})",
+            tofile=f"GitHub master ({filename})",
+            lineterm=''
+        )
+
+        diff_text = '\n'.join(diff)
+        return diff_text if diff_text else "Nessuna differenza trovata"
+
+    def _fetch_changelog(self) -> str:
+        """Scarica il changelog da supabase.com"""
+        print(f"\n[{datetime.now()}] Scaricando changelog...")
+
+        try:
+            resp = requests.get(CHANGELOG_URL, timeout=10)
+            resp.raise_for_status()
+
+            # Estrai solo i contenuti testuali rilevanti
+            # Cerca la sezione con i changelog
+            content = resp.text
+
+            # Estrai i primi N caratteri
+            excerpt = content[:CHANGELOG_EXTRACT_SIZE * 1024]
+
+            print(f"  ✓ Estratti {len(excerpt) // 1024}KB dal changelog")
+            return excerpt
 
         except Exception as e:
-            print(f"Errore scaricando changelog per {service}:{version}: {e}")
+            msg = f"Errore scaricando changelog: {e}"
+            print(f"  ✗ {msg}")
+            self.errors.append(msg)
+            return ""
 
-        return f"Changelog non disponibile per {service}:{version}"
+    def compare(self) -> bool:
+        """Esegui il confronto tra i file"""
+        self._load_local_compose()
+
+        if not self._fetch_github_compose():
+            return False
+
+        print(f"\n[{datetime.now()}] Generando diff...")
+
+        self.compose_diff = self._generate_diff(
+            self.local_compose,
+            self.github_compose,
+            "docker-compose.yml"
+        )
+
+        if self.local_compose_s3:
+            self.compose_s3_diff = self._generate_diff(
+                self.local_compose_s3,
+                self.github_compose_s3,
+                "docker-compose.s3.yml"
+            )
+
+        # Confronta i file .env
+        if self.local_env and self.github_env_example:
+            self.env_diff = self._generate_diff(
+                self.local_env,
+                self.github_env_example,
+                ".env"
+            )
+
+        # Verifica se ci sono effettivamente differenze
+        self.has_changes = (
+            "Nessuna differenza" not in self.compose_diff or
+            (self.compose_s3_diff and "Nessuna differenza" not in self.compose_s3_diff) or
+            (self.env_diff and "Nessuna differenza" not in self.env_diff)
+        )
+
+        if self.has_changes:
+            print(f"  ✓ Differenze trovate")
+            print(f"\nAnteprima diff (prime 20 linee):")
+            diff_lines = self.compose_diff.split('\n')[:20]
+            for line in diff_lines:
+                print(f"    {line}")
+        else:
+            print(f"  ✓ File allineati con GitHub")
+
+        return True
 
     def analyze_with_ai(self) -> Optional[Dict]:
-        """Usa LiteLLM per analizzare i changelog"""
+        """Usa LiteLLM per analizzare diff e changelog"""
         if not LITELLM_API_KEY:
             print(f"\n[{datetime.now()}] ⚠️  Skippando analisi AI (API key non configurata)")
             return None
 
         print(f"\n[{datetime.now()}] Analizzando con AI...")
 
-        changelog_text = "\n\n".join([
-            f"=== {service} ({info['current']} → {info['new']}) ===\n{self.changelogs.get(service, 'N/A')}"
-            for service, info in self.new_versions.items()
-        ])
+        prompt = f"""Sei un esperto DevOps. Analizza SOLO i dati forniti e rispondi in JSON puro, SENZA testo aggiuntivo.
 
-        prompt = f"""Analizza questi changelog di Supabase per gli aggiornamenti disponibili.
-Fornisci un'analisi concisa (max 500 caratteri) che includa:
-1. Breaking changes identificati
-2. Migrazioni database necessarie
-3. Livello di rischio (BASSO/MEDIO/ALTO)
-4. Raccomandazione (procedere subito / testare prima / attendere)
+DIFF docker-compose.yml:
+{self.compose_diff}
 
-Changelogs:
-{changelog_text}
+DIFF docker-compose.s3.yml:
+{self.compose_s3_diff if self.compose_s3_diff else "Identico"}
 
-Rispondi SOLO in formato JSON valido."""
+DIFF .env:
+{self.env_diff if self.env_diff else "Identico"}
+
+CHANGELOG:
+{self.changelog_excerpt}
+
+Rispondi con QUESTO JSON (niente altro):
+{{
+  "versioni_cambiate": ["servizio: old -> new", ...],
+  "variabili_env_nuove": ["VAR1", "VAR2", ...],
+  "variabili_env_modificate": ["VAR1", ...],
+  "breaking_changes": ["descrizione breaking change", ...],
+  "migrazioni_necessarie": ["descrizione migrazione", ...],
+  "livello_rischio": "BASSO|MEDIO|ALTO",
+  "raccomandazione": "procedere subito|testare prima|attendere fix",
+  "verdetto_finale": "breve frase di conclusione"
+}}"""
 
         try:
             headers = {
@@ -184,7 +287,7 @@ Rispondi SOLO in formato JSON valido."""
                 "messages": [
                     {
                         "role": "system",
-                        "content": "Sei un esperto DevOps. Analizza changelog con attenzione ai breaking changes e rischi di produzione."
+                        "content": "Sei un esperto DevOps specializzato in Supabase. Analizza diff e changelog con attenzione ai breaking changes e rischi di produzione. Sii conciso e pratico."
                     },
                     {
                         "role": "user",
@@ -192,35 +295,41 @@ Rispondi SOLO in formato JSON valido."""
                     }
                 ],
                 "temperature": 0.7,
-                "max_tokens": 500
+                "max_tokens": 1000
             }
 
             resp = requests.post(
                 f"{LITELLM_BASE_URL}/v1/chat/completions",
                 json=payload,
                 headers=headers,
-                timeout=30
+                timeout=300
             )
 
             if resp.status_code == 200:
                 result = resp.json()
-                content = result['choices'][0]['message']['content']
-                
-                # FIX 3: Parsing JSON più robusto
+                content = result['choices'][0]['message']['content'].strip()
+
+                # Parsing JSON - estrai il primo { e ultimo }
                 try:
-                    # Prova a estrarre JSON dalla risposta
-                    json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, re.DOTALL)
-                    if json_match:
-                        self.ai_analysis = json.loads(json_match.group())
+                    # Trova la prima { e l'ultima }
+                    start = content.find('{')
+                    end = content.rfind('}') + 1
+                    
+                    if start != -1 and end > start:
+                        json_str = content[start:end]
+                        self.ai_analysis = json.loads(json_str)
                     else:
-                        self.ai_analysis = {"analysis": content}
-                except json.JSONDecodeError:
-                    self.ai_analysis = {"analysis": content}
-                
+                        raise ValueError("No JSON found in response")
+                        
+                except (json.JSONDecodeError, ValueError) as e:
+                    print(f"  ⚠️  Parsing JSON fallito: {e}")
+                    print(f"  Raw response: {content[:500]}")
+                    self.ai_analysis = {"error": "Parsing fallito", "raw": content[:500]}
+
                 print(f"  ✓ Analisi completata")
                 return self.ai_analysis
             else:
-                msg = f"Errore LiteLLM: {resp.status_code}"
+                msg = f"Errore LiteLLM: {resp.status_code} - {resp.text[:200]}"
                 print(f"  ✗ {msg}")
                 self.errors.append(msg)
                 return None
@@ -241,45 +350,57 @@ Rispondi SOLO in formato JSON valido."""
 
         try:
             msg = MIMEMultipart("alternative")
-            msg["Subject"] = f"🔔 Supabase Updates Available ({len(self.new_versions)} servizi)"
+            status = "🔴 AGGIORNAMENTI" if self.has_changes else "🟢 ALLINEATO"
+            msg["Subject"] = f"{status} - Supabase Self-Hosted Monitor"
             msg["From"] = MAIL_FROM
             msg["To"] = ", ".join(MAIL_TO)
 
-            # Costruisci il corpo HTML
             html_content = f"""
             <html>
               <body style="font-family: Arial, sans-serif;">
-                <h2>Supabase Self-Hosted - Aggiornamenti Disponibili</h2>
+                <h2>{status} - Supabase Self-Hosted</h2>
                 <p><strong>Data:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 
-                <h3>Servizi da aggiornare:</h3>
-                <table border="1" cellpadding="10" cellspacing="0" style="border-collapse: collapse;">
-                  <tr style="background-color: #f0f0f0;">
-                    <th>Servizio</th>
-                    <th>Versione Attuale</th>
-                    <th>Nuova Versione</th>
-                  </tr>
+                <h3>📊 Stato Confronto</h3>
+                <p>
+                    {'✅ Repository GitHub è allineato con la configurazione locale' if not self.has_changes else '⚠️ Sono presenti differenze tra la configurazione locale e GitHub master'}
+                </p>
+
+                <h3>📝 Diff docker-compose.yml</h3>
+                <pre style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px;">
+{self.compose_diff}
+                </pre>
             """
 
-            for service, versions in self.new_versions.items():
+            if self.compose_s3_diff:
                 html_content += f"""
-                  <tr>
-                    <td><strong>{service}</strong></td>
-                    <td>{versions['current']}</td>
-                    <td style="color: #0066cc;"><strong>{versions['new']}</strong></td>
-                  </tr>
+                <h3>📝 Diff docker-compose.s3.yml</h3>
+                <pre style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px;">
+{self.compose_s3_diff}
+                </pre>
                 """
 
             html_content += """
-                </table>
+                <h3>🔐 Diff .env (Locale vs .env.example)</h3>
+            """
 
-                <h3>Analisi AI:</h3>
+            if self.env_diff:
+                html_content += f"""
+                <pre style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px;">
+{self.env_diff}
+                </pre>
+                """
+            else:
+                html_content += "<p>✅ File .env allineato con .env.example</p>"
+
+            html_content += """
+                <h3>🤖 Analisi AI:</h3>
             """
 
             if self.ai_analysis:
                 html_content += f"""
                 <pre style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; overflow-x: auto;">
-                {json.dumps(self.ai_analysis, indent=2, ensure_ascii=False)}
+{json.dumps(self.ai_analysis, indent=2, ensure_ascii=False)}
                 </pre>
                 """
             else:
@@ -288,8 +409,9 @@ Rispondi SOLO in formato JSON valido."""
             html_content += """
                 <hr>
                 <p style="color: #666; font-size: 12px;">
-                  ✓ Verifica i changelog in https://github.com/supabase/supabase/releases<br>
-                  ✓ Fai un backup prima di aggiornare<br>
+                  📚 Repo: <a href="https://github.com/supabase/supabase">supabase/supabase</a><br>
+                  📋 Changelog: <a href="https://supabase.com/changelog">supabase.com/changelog</a><br>
+                  ✓ Fai sempre un backup prima di aggiornare<br>
                   ✓ Testa in staging environment
                 </p>
               </body>
@@ -313,8 +435,14 @@ Rispondi SOLO in formato JSON valido."""
 
     def save_state(self):
         """Salva lo stato per il prossimo controllo"""
+        state = {
+            "timestamp": datetime.now().isoformat(),
+            "has_changes": self.has_changes,
+            "compose_diff_lines": len(self.compose_diff.split('\n')),
+            "errors": self.errors
+        }
         with open(STATE_FILE, 'w') as f:
-            json.dump(self.new_versions, f)
+            json.dump(state, f, indent=2)
 
     def print_summary(self):
         """Stampa un riassunto con eventuali errori"""
@@ -325,26 +453,27 @@ Rispondi SOLO in formato JSON valido."""
 
     def run(self):
         """Esegui il ciclo completo"""
-        print("=" * 60)
-        print("Supabase Self-Hosted Update Monitor")
-        print("=" * 60)
+        print("=" * 70)
+        print("Supabase Self-Hosted Update Monitor v2")
+        print("=" * 70)
 
-        print(f"\nVersioni attuali ({len(self.current_versions)} servizi):")
-        for service, version in self.current_versions.items():
-            print(f"  • {service}: {version}")
+        # Scarica il changelog
+        self.changelog_excerpt = self._fetch_changelog()
 
-        if not self.check_new_versions():
-            print("\n✓ Nessun aggiornamento disponibile")
+        # Confronta i file
+        if not self.compare():
+            print("\n✗ Errore durante il confronto dei file")
             self.print_summary()
             return
 
-        print(f"\n✓ Trovati {len(self.new_versions)} aggiornamenti")
-
-        # Scarica i changelog
-        print(f"\n[{datetime.now()}] Scaricando changelog...")
-        for service in self.new_versions:
-            new_version = self.new_versions[service]['new']
-            self.changelogs[service] = self.fetch_changelog(service, new_version)
+        # Se non ci sono cambipamenti, comunica e esci
+        if not self.has_changes:
+            print("\n✓ Configurazione allineata con GitHub master")
+            self.print_summary()
+            if MAIL_TO and SMTP_USER:
+                self.send_email()
+            self.save_state()
+            return
 
         # Analizza con AI
         self.analyze_with_ai()
@@ -362,9 +491,24 @@ Rispondi SOLO in formato JSON valido."""
 
 if __name__ == "__main__":
     try:
+        print("=" * 70)
+        print("Supabase Self-Hosted Update Monitor v2")
+        print("=" * 70)
+        print(f"\nVariabili di configurazione:")
+        print(f"  COMPOSE_FILE: {COMPOSE_FILE}")
+        print(f"  ENV_FILE: {ENV_FILE}")
+        print(f"  LITELLM_BASE_URL: {LITELLM_BASE_URL}")
+        print(f"  MAIL_TO: {MAIL_TO}")
+        
         monitor = SupabaseMonitor()
         monitor.run()
         sys.exit(0)
+    except FileNotFoundError as e:
+        print(f"\n✗ ERRORE FILE NOT FOUND: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
+        import traceback
         print(f"\n✗ ERRORE CRITICO: {e}", file=sys.stderr)
+        print("\nTraceback completo:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
