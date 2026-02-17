@@ -1,0 +1,157 @@
+╔════════════════════════════════════════════════════════════════╗
+║     SUPABASE MONITOR - QUICK START GUIDE                      ║
+╚════════════════════════════════════════════════════════════════╝
+
+FILE INSTALLATI:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ /home/docker/supabase_monitor.py      (script principale)
+✓ /home/docker/supabase-monitor.sh      (wrapper bash per cron)
+✓ /home/docker/.env.supabase-monitor    (file configurazione)
+✓ /home/docker/SUPABASE_MONITOR_README.md (documentazione completa)
+
+
+STEP 1: CONFIGURARE LE CREDENZIALI (OPZIONALE MA CONSIGLIATO)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Apri il file di configurazione:
+  $ nano /home/docker/.env.supabase-monitor
+
+  Compila i campi VUOTI:
+  
+  Per Gmail (notifiche email):
+  ────────────────────────────────
+  - Vai su: https://myaccount.google.com/apppasswords
+  - Genera una "App Password" per Mail
+  - Copia nel campo SMTP_PASSWORD
+  - MAIL_FROM e SMTP_USER = tua email Gmail
+  - MAIL_TO = destinatari separati da virgola
+  
+  Per LiteLLM (analisi AI - opzionale):
+  ────────────────────────────────────
+  - LITELLM_API_KEY = la tua API key
+  - LITELLM_BASE_URL = URL del server LiteLLM
+
+
+STEP 2: TEST MANUALE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Esegui lo script per verificare che tutto funziona:
+  
+  $ source /home/docker/.env.supabase-monitor
+  $ /usr/bin/python3 /home/docker/supabase_monitor.py
+  
+  Output atteso:
+  ✓ Caricando versioni attuali...
+  ✓ Controllando nuove versioni...
+  ✓ Monitoraggio completato
+  
+  Se vedi avvisi su email o LiteLLM, è normale se non configurati.
+
+
+STEP 3: CONFIGURARE CRON (AUTOMAZIONE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Apri crontab:
+  $ crontab -e
+  
+  Aggiungi una di queste righe (scegli la frequenza):
+  
+  Ogni giorno alle 2 AM (CONSIGLIATO):
+  0 2 * * * /home/docker/supabase-monitor.sh
+  
+  Due volte al giorno (2 AM e 2 PM):
+  0 2,14 * * * /home/docker/supabase-monitor.sh
+  
+  Ogni lunedì mattina:
+  0 8 * * 1 /home/docker/supabase-monitor.sh
+  
+  Ogni 6 ore:
+  0 */6 * * * /home/docker/supabase-monitor.sh
+  
+  Salva ed esci (Ctrl+X, Y, Enter su nano)
+
+
+STEP 4: VERIFICA CHE CRON FUNZIONI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Guarda il file di log:
+  $ tail -f /tmp/supabase-monitor.log
+  
+  Output atteso:
+  2026-02-17 14:34:40 - Avvio monitoraggio Supabase
+  2026-02-17 14:34:50 - Fine monitoraggio (exit code: 0)
+  
+  Verifica che cron stia eseguendo:
+  $ grep CRON /var/log/syslog | tail -20
+
+
+STEP 5: (OPZIONALE) RICEVERE EMAIL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Se configurato SMTP, riceverai email quando:
+  1. Nuovi aggiornamenti sono disponibili
+  2. Il soggetto dell'email contiene il numero di servizi da aggiornare
+  3. Inclusa analisi AI se LiteLLM è configurato
+
+
+COSA CONTROLLA IL MONITOR:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Le seguenti immagini Docker:
+✓ supabase/studio            (UI Web)
+✓ supabase/kong              (API Gateway)
+✓ supabase/gotrue            (Auth)
+✓ supabase/postgrest         (API Rest)
+✓ supabase/realtime          (Real-time)
+✓ supabase/storage-api       (File Storage)
+✓ imgproxy                   (Image Processing)
+✓ supabase/postgres-meta     (DB Manager)
+✓ supabase/edge-runtime      (Functions)
+✓ supabase/logflare          (Logging)
+✓ postgres                   (Database)
+✓ vector                     (Vector DB)
+✓ supabase/supavisor         (Pool Manager)
+
+
+FILE IMPORTANTI:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Log:
+  $ tail -f /tmp/supabase-monitor.log
+
+Documentazione completa:
+  $ cat /home/docker/SUPABASE_MONITOR_README.md
+
+Stato ultimo controllo:
+  $ cat /tmp/supabase_versions.json
+
+Configurazione:
+  $ cat /home/docker/.env.supabase-monitor
+
+Script principale:
+  $ cat /home/docker/supabase_monitor.py
+
+
+TROUBLESHOOTING RAPIDO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+P: Non ricevo le email
+R: 1. Controlla che SMTP_PASSWORD sia l'app password di Gmail, non la password dell'account
+   2. Verifica che MAIL_TO non sia vuoto
+   3. Guarda i log: tail -f /tmp/supabase-monitor.log
+
+P: Lo script non trova il docker-compose.yml
+R: Verifica il path: ls /home/docker/dockerCompose/supabase/supatest/docker-compose.yml
+
+P: "LITELLM_API_KEY non configurato"
+R: È opzionale, lo script funziona comunque. Se lo vuoi, aggiungi la tua API key
+
+P: Cron non esegue lo script
+R: 1. Verifica che il file sia eseguibile: chmod +x /home/docker/supabase-monitor.sh
+   2. Controlla i log: grep CRON /var/log/syslog
+   3. Test manuale: /home/docker/supabase-monitor.sh
+
+
+╔════════════════════════════════════════════════════════════════╗
+║  Setup completato! Per domande, consulta SUPABASE_MONITOR_README.md
+╚════════════════════════════════════════════════════════════════╝
