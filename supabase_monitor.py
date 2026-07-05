@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Supabase Self-Hosted Update Monitor - v3
+Supabase Self-Hosted Update Monitor - v4
 Confronta docker-compose.yml locali con quelli del repo GitHub ufficiale
 Genera una RUNBOOK completa step-by-step per l'aggiornamento manuale
 """
@@ -11,6 +11,7 @@ import re
 import sys
 import difflib
 import subprocess
+import yaml
 from datetime import datetime
 from typing import Dict, Optional, List, Tuple
 import smtplib
@@ -68,12 +69,17 @@ class SupabaseMonitor:
         self.ai_analysis = None
         self.errors = []
         self.has_changes = False
-        
+
+        # Confronto strutturato (non soggetto a troncamenti)
+        self.service_version_changes: List[str] = []
+        self.env_vars_nuove: List[str] = []
+        self.env_vars_rimosse: List[str] = []
+
         # Version tracking
         self.current_version_info = {}
         self.github_commit_sha = ""
         self.github_latest_tag = ""
-        
+
         self._ensure_state_dir()
         self._validate_config()
 
@@ -228,6 +234,65 @@ class SupabaseMonitor:
         diff_text = '\n'.join(diff)
         return diff_text if diff_text else "Nessuna differenza trovata"
 
+    def _extract_service_versions(self, compose_text: str) -> Dict[str, str]:
+        """Estrae {nome_servizio: immagine:tag} da un docker-compose.yml.
+
+        Lavora sulla struttura YAML già interpretata, quindi non ha limiti
+        di lunghezza: processa TUTTI i servizi, non solo i primi che
+        compaiono nel file.
+        """
+        if not compose_text:
+            return {}
+        try:
+            data = yaml.safe_load(compose_text)
+            services = data.get("services", {}) if data else {}
+            return {
+                name: svc.get("image", "")
+                for name, svc in services.items()
+                if isinstance(svc, dict) and svc.get("image")
+            }
+        except Exception as e:
+            print(f"  ⚠️  Errore parsing YAML: {e}")
+            return {}
+
+    def _diff_service_versions(self, local_text: str, github_text: str) -> List[str]:
+        """Confronta la versione immagine di OGNI servizio, senza troncamenti"""
+        local_versions = self._extract_service_versions(local_text)
+        github_versions = self._extract_service_versions(github_text)
+
+        changes = []
+        all_services = sorted(set(local_versions) | set(github_versions))
+
+        for name in all_services:
+            local_img = local_versions.get(name, "‹assente localmente›")
+            github_img = github_versions.get(name, "‹rimosso da GitHub›")
+            if local_img != github_img:
+                changes.append(f"{name}: {local_img} -> {github_img}")
+
+        return changes
+
+    def _diff_env_vars(self, local_env: str, github_env_example: str) -> Tuple[List[str], List[str]]:
+        """Confronta le CHIAVI (mai i valori, per non esporre segreti)
+        tra il .env locale e il .env.example di GitHub.
+        """
+        def parse_keys(text: str) -> set:
+            keys = set()
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    keys.add(line.split("=", 1)[0].strip())
+            return keys
+
+        local_keys = parse_keys(local_env)
+        github_keys = parse_keys(github_env_example)
+
+        nuove = sorted(github_keys - local_keys)
+        rimosse = sorted(local_keys - github_keys)
+
+        return nuove, rimosse
+
     def _fetch_changelog(self) -> str:
         """Scarica il changelog"""
         print(f"\n[{datetime.now()}] Scaricando changelog...")
@@ -253,7 +318,7 @@ class SupabaseMonitor:
         if not self._fetch_github_compose():
             return False
 
-        print(f"\n[{datetime.now()}] Generando diff...")
+        print(f"\n[{datetime.now()}] Generando diff testuale...")
 
         self.compose_diff = self._generate_diff(
             self.local_compose,
@@ -275,40 +340,77 @@ class SupabaseMonitor:
                 ".env"
             )
 
+        print(f"\n[{datetime.now()}] Generando confronto strutturato (versioni servizi + variabili env)...")
+
+        # Confronto strutturato: elabora TUTTI i servizi/variabili, senza
+        # alcun limite di dimensione, a differenza del diff testuale grezzo.
+        self.service_version_changes = self._diff_service_versions(
+            self.local_compose, self.github_compose
+        )
+        if self.local_compose_s3 and self.github_compose_s3:
+            self.service_version_changes += self._diff_service_versions(
+                self.local_compose_s3, self.github_compose_s3
+            )
+
+        if self.local_env and self.github_env_example:
+            self.env_vars_nuove, self.env_vars_rimosse = self._diff_env_vars(
+                self.local_env, self.github_env_example
+            )
+        else:
+            self.env_vars_nuove, self.env_vars_rimosse = [], []
+
+        if self.service_version_changes:
+            print(f"  ✓ {len(self.service_version_changes)} servizi con versione cambiata:")
+            for change in self.service_version_changes:
+                print(f"    - {change}")
+        if self.env_vars_nuove:
+            print(f"  ✓ {len(self.env_vars_nuove)} nuove variabili env richieste")
+        if self.env_vars_rimosse:
+            print(f"  ✓ {len(self.env_vars_rimosse)} variabili env rimosse/deprecate")
+
         self.has_changes = (
             "Nessuna differenza" not in self.compose_diff or
             (self.compose_s3_diff and "Nessuna differenza" not in self.compose_s3_diff) or
-            (self.env_diff and "Nessuna differenza" not in self.env_diff)
+            (self.env_diff and "Nessuna differenza" not in self.env_diff) or
+            bool(self.service_version_changes) or
+            bool(self.env_vars_nuove) or
+            bool(self.env_vars_rimosse)
         )
 
         if self.has_changes:
             print(f"  ✓ Differenze trovate")
-            diff_lines = self.compose_diff.split('\n')[:15]
-            for line in diff_lines:
-                print(f"    {line}")
         else:
             print(f"  ✓ File allineati con GitHub")
 
         return True
 
     def analyze_with_ai(self) -> Optional[Dict]:
-        """Usa LiteLLM per analizzare diff e changelog"""
+        """Usa LiteLLM per analizzare il confronto strutturato e il changelog"""
         if not LITELLM_API_KEY:
             print(f"\n[{datetime.now()}] ⚠️  Skippando analisi AI (API key non configurata)")
             return None
 
         print(f"\n[{datetime.now()}] Analizzando con AI...")
 
-        compose_diff_limited = self.compose_diff[:2000] if self.compose_diff else ""
         changelog_limited = self.changelog_excerpt[:1000] if self.changelog_excerpt else ""
+
+        # Riassunto strutturato: copre TUTTI i servizi e TUTTE le variabili,
+        # a differenza del vecchio approccio che troncava il diff testuale
+        # grezzo (compose_diff[:2000], compose_s3_diff[:500]) perdendo
+        # tutto ciò che seguiva i primi servizi elencati nel file.
+        versioni_summary = "\n".join(self.service_version_changes) if self.service_version_changes else "Nessuna modifica versione immagine rilevata"
+        env_summary = (
+            f"Nuove variabili richieste: {', '.join(self.env_vars_nuove) if self.env_vars_nuove else 'nessuna'}\n"
+            f"Variabili rimosse/deprecate: {', '.join(self.env_vars_rimosse) if self.env_vars_rimosse else 'nessuna'}"
+        )
 
         prompt = f"""Analizza questo aggiornamento Supabase e rispondi ESCLUSIVAMENTE con JSON valido.
 
-DIFF docker-compose.yml:
-{compose_diff_limited}
+VERSIONI IMMAGINE CAMBIATE (per ogni servizio, include sia docker-compose.yml che docker-compose.s3.yml):
+{versioni_summary}
 
-DIFF docker-compose.s3.yml:
-{self.compose_s3_diff[:500] if self.compose_s3_diff else "Identico"}
+VARIABILI D'AMBIENTE:
+{env_summary}
 
 CHANGELOG:
 {changelog_limited}
@@ -394,17 +496,7 @@ Rispondi con esattamente questo JSON:
                             continue
 
                     if not parsed:
-                        self.ai_analysis = {
-                            "versioni_cambiate": [],
-                            "variabili_env_nuove": [],
-                            "variabili_env_modificate": [],
-                            "breaking_changes": [],
-                            "migrazioni_necessarie": [],
-                            "livello_rischio": "SCONOSCIUTO",
-                            "raccomandazione": "Impossibile analizzare con AI",
-                            "stima_downtime_minuti": 0,
-                            "verdetto_finale": f"Errore: {str(e)}"
-                        }
+                        self.ai_analysis = self._fallback_analysis(str(e))
 
                 return self.ai_analysis
             else:
@@ -419,15 +511,36 @@ Rispondi con esattamente questo JSON:
             self.errors.append(msg)
             return None
 
+    def _fallback_analysis(self, error_msg: str) -> Dict:
+        """Analisi di riserva basata sui dati strutturati, usata se l'AI fallisce.
+
+        Anche in questo caso di errore, la runbook mostrerà comunque
+        TUTTI i servizi e le variabili cambiate, perché questi dati
+        arrivano dal confronto strutturato e non dall'AI.
+        """
+        return {
+            "versioni_cambiate": list(self.service_version_changes),
+            "variabili_env_nuove": list(self.env_vars_nuove),
+            "variabili_env_modificate": [],
+            "breaking_changes": [],
+            "migrazioni_necessarie": [],
+            "livello_rischio": "SCONOSCIUTO",
+            "raccomandazione": "Analisi AI non disponibile: rivedere manualmente i cambiamenti elencati sopra",
+            "stima_downtime_minuti": 0,
+            "verdetto_finale": f"Errore AI: {error_msg}"
+        }
+
     def _build_runbook(self) -> str:
         """Genera la RUNBOOK completa per l'aggiornamento manuale"""
         if not self.ai_analysis:
-            return ""
+            # Se l'AI non è stata invocata affatto (es. API key mancante),
+            # usa comunque il confronto strutturato per non perdere info.
+            self.ai_analysis = self._fallback_analysis("Analisi AI non eseguita")
 
         analysis = self.ai_analysis
         risk_level = analysis.get("livello_rischio", "SCONOSCIUTO").upper()
         downtime_est = analysis.get("stima_downtime_minuti", 5)
-        
+
         risk_color_map = {
             "ALTO": "#d32f2f",
             "MEDIO": "#f57c00",
@@ -464,40 +577,50 @@ Rispondi con esattamente questo JSON:
     <p style="margin: 0;"><strong>Downtime Previsto:</strong> ~{downtime_est} minuti</p>
 </div>
 
-<!-- VERSIONI CAMBIATE -->
+<!-- VERSIONI CAMBIATE (dato strutturato: copre TUTTI i servizi) -->
 """
-        
-        versioni = analysis.get("versioni_cambiate", [])
+
+        # Usiamo sempre il confronto strutturato come fonte primaria per le
+        # versioni, così la runbook mostra sempre TUTTI i servizi cambiati
+        # anche se l'AI ne ha riassunti/omessi alcuni nella sua risposta.
+        versioni = self.service_version_changes or analysis.get("versioni_cambiate", [])
         if versioni:
             html += """
 <div style="margin-bottom: 30px; background-color: #f9f9f9; padding: 15px; border-left: 4px solid #1976d2; border-radius: 4px;">
-    <h3 style="margin: 0 0 10px 0; color: #1976d2;">📦 VERSIONI CAMBIATE</h3>
+    <h3 style="margin: 0 0 10px 0; color: #1976d2;">📦 VERSIONI CAMBIATE (""" + str(len(versioni)) + """ servizi)</h3>
     <pre style="margin: 0; overflow-x: auto; font-size: 12px;">"""
             for v in versioni:
                 html += f"{v}\n"
             html += "</pre></div>\n"
 
-        # VARIABILI MODIFICATE
+        # VARIABILI (dato strutturato come fonte primaria, AI come arricchimento)
         var_modificate = analysis.get("variabili_env_modificate", [])
-        var_nuove = analysis.get("variabili_env_nuove", [])
-        
-        if var_modificate or var_nuove:
+        var_nuove = self.env_vars_nuove or analysis.get("variabili_env_nuove", [])
+        var_rimosse = self.env_vars_rimosse
+
+        if var_modificate or var_nuove or var_rimosse:
             html += """
 <div style="margin-bottom: 30px; background-color: #f9f9f9; padding: 15px; border-left: 4px solid #f57c00; border-radius: 4px;">
     <h3 style="margin: 0 0 10px 0; color: #f57c00;">⚙️ VARIABILI D'AMBIENTE</h3>
 """
             if var_nuove:
-                html += "<p style='margin: 0 0 5px 0;'><strong>Nuove variabili richieste:</strong></p><pre style='margin: 0 0 10px 0; font-size: 12px; background-color: #fff3e0; padding: 10px; border-radius: 4px;'>"
+                html += "<p style='margin: 0 0 5px 0;'><strong>Nuove variabili richieste (" + str(len(var_nuove)) + "):</strong></p><pre style='margin: 0 0 10px 0; font-size: 12px; background-color: #fff3e0; padding: 10px; border-radius: 4px;'>"
                 for v in var_nuove:
                     html += f"# Aggiungi al .env:\n{v}=VALORE_QUI\n"
                 html += "</pre>"
-            
+
+            if var_rimosse:
+                html += "<p style='margin: 10px 0 5px 0;'><strong>Variabili rimosse/deprecate (" + str(len(var_rimosse)) + "):</strong></p><pre style='margin: 0 0 10px 0; font-size: 12px; background-color: #eeeeee; padding: 10px; border-radius: 4px;'>"
+                for v in var_rimosse:
+                    html += f"{v}\n"
+                html += "</pre>"
+
             if var_modificate:
-                html += "<p style='margin: 10px 0 5px 0;'><strong>Variabili modificate:</strong></p><pre style='margin: 0; font-size: 12px; background-color: #fff3e0; padding: 10px; border-radius: 4px;'>"
+                html += "<p style='margin: 10px 0 5px 0;'><strong>Variabili modificate (dettaglio AI):</strong></p><pre style='margin: 0; font-size: 12px; background-color: #fff3e0; padding: 10px; border-radius: 4px;'>"
                 for v in var_modificate:
                     html += f"{v}\n"
                 html += "</pre>"
-            
+
             html += "</div>\n"
 
         # BREAKING CHANGES
@@ -534,7 +657,7 @@ Rispondi con esattamente questo JSON:
         html += """
 <div style="margin-bottom: 30px; background-color: #e8f5e9; padding: 15px; border-left: 4px solid #388e3c; border-radius: 4px;">
     <h3 style="margin: 0 0 15px 0; color: #388e3c;">📋 ISTRUZIONI PASSO-PASSO</h3>
-    
+
     <h4 style="margin: 15px 0 10px 0; color: #1976d2;">FASE 0: PRE-UPDATE CHECKLIST</h4>
     <pre style="background-color: white; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #ddd;">
 □ Verificare spazio disco (almeno 10GB liberi)
@@ -731,7 +854,7 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
     <p><strong>Data:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
     <p>La configurazione locale è allineata con il repository GitHub master.</p>
     <p>Nessun aggiornamento necessario al momento.</p>
-    
+
     <hr>
     <p style="color: #666; font-size: 12px;">
         Versione Attuale: {self.current_version_info.get('docker_compose_sha', 'unknown')}<br>
@@ -764,8 +887,11 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
             "github_commit": self.github_commit_sha,
             "has_changes": self.has_changes,
             "compose_diff_lines": len(self.compose_diff.split('\n')),
+            "service_version_changes": self.service_version_changes,
+            "env_vars_nuove": self.env_vars_nuove,
+            "env_vars_rimosse": self.env_vars_rimosse,
         }
-        
+
         try:
             with open(STATE_FILE, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -784,7 +910,7 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
     def run(self):
         """Esegui il ciclo completo"""
         print("=" * 70)
-        print("Supabase Self-Hosted Update Monitor v3")
+        print("Supabase Self-Hosted Update Monitor v4")
         print("=" * 70)
 
         self.changelog_excerpt = self._fetch_changelog()
@@ -818,14 +944,14 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
 if __name__ == "__main__":
     try:
         print("=" * 70)
-        print("Supabase Self-Hosted Update Monitor v3")
+        print("Supabase Self-Hosted Update Monitor v4")
         print("=" * 70)
         print(f"\nConfigurazione:")
         print(f"  COMPOSE_DIR: {COMPOSE_DIR}")
         print(f"  STATE_DIR: {STATE_DIR}")
         print(f"  LITELLM_MODEL: {LITELLM_MODEL}")
         print(f"  MAIL_TO: {MAIL_TO}")
-        
+
         monitor = SupabaseMonitor()
         monitor.run()
         sys.exit(0)
