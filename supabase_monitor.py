@@ -33,6 +33,12 @@ GITHUB_COMPOSE_S3_URL = "https://raw.githubusercontent.com/supabase/supabase/ref
 CHANGELOG_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/CHANGELOG.md"
 GITHUB_ENV_EXAMPLE_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/.env.example"
 GITHUB_API_COMMITS = "https://api.github.com/repos/supabase/supabase/commits"
+# Opzionale ma consigliato: senza token, GitHub limita le richieste API a
+# 60/ora per IP (facile da sforare dato che facciamo più chiamate API per
+# esecuzione: commits + compare). Con un Personal Access Token (anche senza
+# permessi particolari, basta "public_repo" read) il limite sale a 5000/ora.
+# Crealo su https://github.com/settings/tokens
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 # LiteLLM
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://localhost:4000")
@@ -78,7 +84,9 @@ class SupabaseMonitor:
         # Version tracking
         self.current_version_info = {}
         self.github_commit_sha = ""
+        self.github_commit_sha_full = ""
         self.github_latest_tag = ""
+        self.relevant_changelog = ""  # commit reali tra versione deployata e attuale
 
         self._ensure_state_dir()
         self._validate_config()
@@ -100,6 +108,9 @@ class SupabaseMonitor:
 
         if not os.path.exists(ENV_FILE):
             print(f"  ⚠️  .env non trovato: {ENV_FILE}")
+
+        if not GITHUB_TOKEN:
+            self.errors.append("ℹ️  GITHUB_TOKEN non configurato: le chiamate API GitHub sono limitate a 60/ora (rischio rate-limit rilevato durante i test)")
 
         if not LITELLM_API_KEY:
             self.errors.append("⚠️  LITELLM_API_KEY non configurato")
@@ -136,6 +147,23 @@ class SupabaseMonitor:
         except:
             pass
         return "unknown"
+
+    def _get_git_commit_sha_full(self) -> str:
+        """Estrae lo SHA completo (40 char) del repo locale, necessario per
+        chiamare la GitHub Compare API (lo SHA troncato a 16 char non basta)."""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=COMPOSE_DIR,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except:
+            pass
+        return ""
 
     def _load_current_version(self):
         """Carica lo stato della versione precedente"""
@@ -205,12 +233,14 @@ class SupabaseMonitor:
             print(f"  ⚠️  Errore scaricando .env.example: {e}")
 
         # Estrai commit SHA dal repo GitHub
+        gh_headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
         try:
-            resp = requests.get(f"{GITHUB_API_COMMITS}?per_page=1&sha=master", timeout=10)
+            resp = requests.get(f"{GITHUB_API_COMMITS}?per_page=1&sha=master", headers=gh_headers, timeout=10)
             resp.raise_for_status()
             commits = resp.json()
             if commits:
-                self.github_commit_sha = commits[0]['sha'][:16]
+                self.github_commit_sha_full = commits[0]['sha']
+                self.github_commit_sha = self.github_commit_sha_full[:16]
                 print(f"  ✓ GitHub commit: {self.github_commit_sha}")
         except Exception as e:
             print(f"  ⚠️  Errore ricevendo commit SHA: {e}")
@@ -292,6 +322,60 @@ class SupabaseMonitor:
         rimosse = sorted(local_keys - github_keys)
 
         return nuove, rimosse
+
+    def _fetch_commits_between(self, base_sha: str, head_sha: str) -> str:
+        """Usa la GitHub Compare API per ottenere l'elenco REALE dei commit
+        tra la versione attualmente deployata (base) e quella disponibile
+        su master (head). A differenza dell'estratto statico di
+        CHANGELOG.md, questo è sempre esattamente delimitato al periodo
+        rilevante, indipendentemente da quanto tempo sia passato dall'ultimo
+        aggiornamento.
+
+        NOTA: richiede SHA completi (40 caratteri), non troncati.
+        Ritorna stringa vuota se non applicabile (es. prima esecuzione,
+        SHA mancante, o errore di rete).
+        """
+        if not base_sha or not head_sha or base_sha == head_sha:
+            return ""
+
+        url = f"https://api.github.com/repos/supabase/supabase/compare/{base_sha}...{head_sha}"
+        gh_headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+        try:
+            resp = requests.get(url, headers=gh_headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"  ⚠️  Errore chiamando GitHub Compare API: {e}")
+            return ""
+
+        total_commits = data.get("total_commits", 0)
+        commits = data.get("commits", [])
+        files = data.get("files", [])
+
+        # Filtra solo i file sotto docker/ per capire se il range di commit
+        # tocca effettivamente la parte self-hosted che ci interessa
+        docker_files = [f["filename"] for f in files if f.get("filename", "").startswith("docker/")]
+
+        lines = [f"Commit reali tra {base_sha[:10]} (deployato) e {head_sha[:10]} (disponibile): {total_commits} totali"]
+
+        if docker_files:
+            lines.append(f"File sotto docker/ toccati in questo range: {', '.join(docker_files[:30])}")
+        else:
+            lines.append("Nessun file sotto docker/ toccato in questo range (probabile falso positivo nel confronto compose)")
+
+        # Messaggi di commit (solo prima riga, per restare compatti)
+        for c in commits[:50]:
+            msg = c.get("commit", {}).get("message", "").split("\n")[0].strip()
+            sha_short = c.get("sha", "")[:10]
+            if msg:
+                lines.append(f"- [{sha_short}] {msg}")
+
+        if total_commits > 50:
+            lines.append(f"... e altri {total_commits - 50} commit non mostrati (troppi per il prompt)")
+
+        result = "\n".join(lines)
+        print(f"  ✓ Compare API: {total_commits} commit, {len(docker_files)} file docker/ toccati")
+        return result
 
     def _fetch_changelog(self) -> str:
         """Scarica il changelog"""
@@ -382,6 +466,18 @@ class SupabaseMonitor:
         else:
             print(f"  ✓ File allineati con GitHub")
 
+        # Recupera il changelog REALE (commit veri) tra la versione deployata
+        # nell'esecuzione precedente e quella disponibile ora. Preferito
+        # rispetto all'estratto statico di CHANGELOG.md perché è sempre
+        # esattamente delimitato al periodo che interessa.
+        if self.has_changes:
+            print(f"\n[{datetime.now()}] Recuperando commit reali da GitHub Compare API...")
+            base_sha_full = self.current_version_info.get("github_commit_full", "")
+            head_sha_full = self.github_commit_sha_full
+            self.relevant_changelog = self._fetch_commits_between(base_sha_full, head_sha_full)
+            if not self.relevant_changelog:
+                print(f"  ℹ️  Compare API non disponibile (probabile prima esecuzione), uso estratto statico del CHANGELOG.md")
+
         return True
 
     def analyze_with_ai(self) -> Optional[Dict]:
@@ -392,7 +488,17 @@ class SupabaseMonitor:
 
         print(f"\n[{datetime.now()}] Analizzando con AI...")
 
-        changelog_limited = self.changelog_excerpt[:1000] if self.changelog_excerpt else ""
+        # Preferiamo il changelog REALE (commit veri ottenuti dalla Compare
+        # API, delimitato esattamente al range tra versione deployata e
+        # disponibile). Ripieghiamo sull'estratto statico di CHANGELOG.md
+        # solo se la Compare API non è disponibile (es. prima esecuzione,
+        # in cui non abbiamo ancora uno SHA precedente salvato).
+        if self.relevant_changelog:
+            changelog_limited = self.relevant_changelog[:4000]
+            changelog_source_note = "(fonte: commit reali via GitHub Compare API)"
+        else:
+            changelog_limited = self.changelog_excerpt[:1000] if self.changelog_excerpt else ""
+            changelog_source_note = "(fonte: estratto statico CHANGELOG.md, non delimitato alla versione deployata)"
 
         # Riassunto strutturato: copre TUTTI i servizi e TUTTE le variabili,
         # a differenza del vecchio approccio che troncava il diff testuale
@@ -412,7 +518,7 @@ VERSIONI IMMAGINE CAMBIATE (per ogni servizio, include sia docker-compose.yml ch
 VARIABILI D'AMBIENTE:
 {env_summary}
 
-CHANGELOG:
+CHANGELOG {changelog_source_note}:
 {changelog_limited}
 
 Rispondi con esattamente questo JSON:
@@ -592,6 +698,15 @@ Rispondi con esattamente questo JSON:
             for v in versioni:
                 html += f"{v}\n"
             html += "</pre></div>\n"
+
+        # CHANGELOG REALE (commit via Compare API, fonte primaria e verificabile)
+        if self.relevant_changelog:
+            html += """
+<div style="margin-bottom: 30px; background-color: #f9f9f9; padding: 15px; border-left: 4px solid #455a64; border-radius: 4px;">
+    <h3 style="margin: 0 0 10px 0; color: #455a64;">📜 CHANGELOG REALE (commit tra versione deployata e disponibile)</h3>
+    <pre style="margin: 0; overflow-x: auto; font-size: 11px; white-space: pre-wrap;">""" + self.relevant_changelog + """</pre>
+</div>
+"""
 
         # VARIABILI (dato strutturato come fonte primaria, AI come arricchimento)
         var_modificate = analysis.get("variabili_env_modificate", [])
@@ -885,6 +1000,7 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
             "docker_compose_sha": self._get_file_hash(COMPOSE_FILE),
             "git_commit": self._get_git_commit_sha(),
             "github_commit": self.github_commit_sha,
+            "github_commit_full": self.github_commit_sha_full,
             "has_changes": self.has_changes,
             "compose_diff_lines": len(self.compose_diff.split('\n')),
             "service_version_changes": self.service_version_changes,
