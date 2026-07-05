@@ -276,16 +276,20 @@ Rispondi con esattamente questo JSON:
                 "model": LITELLM_MODEL,
                 "messages": [
                     {
+                        "role": "system",
+                        "content": "Sei un esperto DevOps. Analizza i dati forniti e RESTITUISCI ESCLUSIVAMENTE UN JSON VALIDO nel tuo messaggio. Il JSON deve essere completo e valido. Non aggiungere testo prima o dopo il JSON."
+                    },
+                    {
                         "role": "user",
                         "content": prompt
                     }
                 ],
-                "temperature": 0.1,
-                "max_tokens": 500  # Ridotto per evitare token limit
+                "temperature": 0.2,
+                "max_tokens": 2000  # Aumentato per permettere ragionamento + JSON
             }
 
             print(f"  [DEBUG] Modello: {LITELLM_MODEL}")
-            print(f"  [DEBUG] max_tokens: 500")
+            print(f"  [DEBUG] max_tokens: 2000")
 
             resp = requests.post(
                 f"{LITELLM_BASE_URL}/v1/chat/completions",
