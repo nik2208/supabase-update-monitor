@@ -240,33 +240,30 @@ class SupabaseMonitor:
         print(f"\n[{datetime.now()}] Analizzando con AI...")
 
         # Limita il testo dei diff per evitare token troppi
-        compose_diff_limited = self.compose_diff[:3000] if self.compose_diff else ""
-        changelog_limited = self.changelog_excerpt[:2000] if self.changelog_excerpt else ""
+        compose_diff_limited = self.compose_diff[:2000] if self.compose_diff else ""
+        changelog_limited = self.changelog_excerpt[:1000] if self.changelog_excerpt else ""
 
-        prompt = f"""Sei un esperto DevOps. Analizza i dati forniti e rispondi ESCLUSIVAMENTE in JSON valido.
+        prompt = f"""Analizza questo diff e rispondi ESCLUSIVAMENTE con JSON valido.
 
-DIFF docker-compose.yml (primi 3000 caratteri):
+DIFF docker-compose.yml:
 {compose_diff_limited}
 
 DIFF docker-compose.s3.yml:
-{self.compose_s3_diff[:1000] if self.compose_s3_diff else "Identico"}
+{self.compose_s3_diff[:500] if self.compose_s3_diff else "Identico"}
 
-DIFF .env (se presente):
-{self.env_diff[:1000] if self.env_diff else "Identico o non disponibile"}
-
-CHANGELOG (estratto):
+CHANGELOG:
 {changelog_limited}
 
-Rispondi SOLO con questo JSON, senza nessun testo aggiuntivo prima o dopo:
+Rispondi con esattamente questo JSON:
 {{
   "versioni_cambiate": ["servizio: old -> new"],
-  "variabili_env_nuove": ["VAR1"],
-  "variabili_env_modificate": ["VAR1"],
-  "breaking_changes": ["descrizione"],
-  "migrazioni_necessarie": ["descrizione"],
+  "variabili_env_nuove": [],
+  "variabili_env_modificate": [],
+  "breaking_changes": [],
+  "migrazioni_necessarie": [],
   "livello_rischio": "BASSO",
   "raccomandazione": "procedere",
-  "verdetto_finale": "conclusione"
+  "verdetto_finale": "analisi completata"
 }}"""
 
         try:
@@ -279,20 +276,16 @@ Rispondi SOLO con questo JSON, senza nessun testo aggiuntivo prima o dopo:
                 "model": LITELLM_MODEL,
                 "messages": [
                     {
-                        "role": "system",
-                        "content": "Rispondi ESCLUSIVAMENTE con JSON valido, niente altro. Non aggiungere testo prima o dopo il JSON."
-                    },
-                    {
                         "role": "user",
                         "content": prompt
                     }
                 ],
-                "temperature": 0.3,
-                "max_tokens": 1000
+                "temperature": 0.1,
+                "max_tokens": 500  # Ridotto per evitare token limit
             }
 
             print(f"  [DEBUG] Modello: {LITELLM_MODEL}")
-            print(f"  [DEBUG] URL: {LITELLM_BASE_URL}/v1/chat/completions")
+            print(f"  [DEBUG] max_tokens: 500")
 
             resp = requests.post(
                 f"{LITELLM_BASE_URL}/v1/chat/completions",
@@ -302,39 +295,22 @@ Rispondi SOLO con questo JSON, senza nessun testo aggiuntivo prima o dopo:
             )
 
             print(f"  [DEBUG] Status code: {resp.status_code}")
-            print(f"  [DEBUG] Response headers: {dict(resp.headers)}")
-            
-            # Dump della risposta JSON completa per debug
-            print(f"  [DEBUG] Response body (raw): {resp.text[:1000]}")
-            
-            if resp.status_code == 200:
-                try:
-                    result = resp.json()
-                    print(f"  [DEBUG] Response JSON parsed: {json.dumps(result, indent=2)[:500]}")
-                    
-                    # Naviga la struttura della risposta
-                    if 'choices' in result and len(result['choices']) > 0:
-                        choice = result['choices'][0]
-                        if 'message' in choice and 'content' in choice['message']:
-                            content = choice['message']['content'].strip()
-                        else:
-                            print(f"  [DEBUG] Struttura 'choices' inaspettata: {json.dumps(choice, indent=2)[:300]}")
-                            content = ""
-                    else:
-                        print(f"  [DEBUG] Response non contiene 'choices': {list(result.keys())}")
-                        content = ""
-                    
-                except json.JSONDecodeError as je:
-                    print(f"  ⚠️  Errore parsing JSON response: {je}")
-                    print(f"  [DEBUG] Raw response: {resp.text[:500]}")
-                    content = ""
 
-                print(f"  [DEBUG] Lunghezza risposta: {len(content)} caratteri")
+            if resp.status_code == 200:
+                result = resp.json()
+                
+                # Prova a estrarre il content dalla struttura della risposta
+                message = result.get('choices', [{}])[0].get('message', {})
+                content = message.get('content', '').strip()
+                
+                # Se content è vuoto, prova reasoning_content (per modelli con reasoning)
+                if not content:
+                    print(f"  [DEBUG] Content vuoto, tentando reasoning_content...")
+                    content = message.get('reasoning_content', '').strip()
+                
+                print(f"  [DEBUG] Lunghezza content: {len(content)}")
                 if content:
-                    print(f"  [DEBUG] Primi 200 caratteri: {content[:200]}")
-                    print(f"  [DEBUG] Ultimi 200 caratteri: {content[-200:]}")
-                else:
-                    print(f"  [DEBUG] Content è vuoto!")
+                    print(f"  [DEBUG] Primi 300 caratteri: {content[:300]}")
 
                 # Parsing JSON - estrai il primo { e ultimo }
                 try:
@@ -347,31 +323,38 @@ Rispondi SOLO con questo JSON, senza nessun testo aggiuntivo prima o dopo:
                     
                     if start != -1 and end > start:
                         json_str = content[start:end]
-                        print(f"  [DEBUG] JSON estratto ({len(json_str)} char): {json_str[:300]}")
                         self.ai_analysis = json.loads(json_str)
                         print(f"  ✓ JSON parsato correttamente")
                     else:
+                        print(f"  [DEBUG] Nessun JSON trovato in: {content[:200]}")
                         raise ValueError("No JSON found in response")
                         
                 except (json.JSONDecodeError, ValueError) as e:
                     print(f"  ⚠️  Parsing JSON fallito: {e}")
-                    print(f"  Raw response: {content[:500]}")
-                    self.ai_analysis = {"error": "Parsing fallito", "raw": content[:500]}
+                    # Fallback: crea un'analisi vuota
+                    self.ai_analysis = {
+                        "versioni_cambiate": [],
+                        "variabili_env_nuove": [],
+                        "variabili_env_modificate": [],
+                        "breaking_changes": [],
+                        "migrazioni_necessarie": [],
+                        "livello_rischio": "SCONOSCIUTO",
+                        "raccomandazione": "Impossibile analizzare con AI",
+                        "verdetto_finale": f"Errore: {str(e)}"
+                    }
 
                 print(f"  ✓ Analisi completata")
                 return self.ai_analysis
             else:
                 msg = f"Errore LiteLLM: {resp.status_code}"
                 print(f"  ✗ {msg}")
-                print(f"  [DEBUG] Response body: {resp.text[:500]}")
+                print(f"  [DEBUG] Response: {resp.text[:300]}")
                 self.errors.append(msg)
                 return None
 
         except Exception as e:
             msg = f"Errore durante analisi AI: {e}"
             print(f"  ✗ {msg}")
-            import traceback
-            traceback.print_exc()
             self.errors.append(msg)
             return None
 
