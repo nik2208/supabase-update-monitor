@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Supabase Self-Hosted Update Monitor - v2
+Supabase Self-Hosted Update Monitor - v3
 Confronta docker-compose.yml locali con quelli del repo GitHub ufficiale
-Scarica il changelog e invia tutto ad AI per analisi
+Genera una RUNBOOK completa step-by-step per l'aggiornamento manuale
 """
 
 import os
@@ -10,8 +10,9 @@ import json
 import re
 import sys
 import difflib
+import subprocess
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, List, Tuple
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -20,15 +21,17 @@ from pathlib import Path
 
 # === CONFIGURAZIONE ===
 # File locali
-COMPOSE_FILE = os.getenv("COMPOSE_FILE", "/home/docker/dockerCompose/supabase/supatest/docker-compose.yml")
-COMPOSE_S3_FILE = os.getenv("COMPOSE_S3_FILE", "/home/docker/dockerCompose/supabase/supatest/docker-compose.s3.yml")
-ENV_FILE = os.getenv("ENV_FILE", "/home/docker/dockerCompose/supabase/supatest/.env")
+COMPOSE_DIR = os.getenv("COMPOSE_DIR", "/home/docker/dockerCompose/supabase/supatest")
+COMPOSE_FILE = os.path.join(COMPOSE_DIR, "docker-compose.yml")
+COMPOSE_S3_FILE = os.path.join(COMPOSE_DIR, "docker-compose.s3.yml")
+ENV_FILE = os.path.join(COMPOSE_DIR, ".env")
 
 # GitHub URLs
 GITHUB_COMPOSE_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/docker-compose.yml"
 GITHUB_COMPOSE_S3_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/docker-compose.s3.yml"
 CHANGELOG_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/CHANGELOG.md"
 GITHUB_ENV_EXAMPLE_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/.env.example"
+GITHUB_API_COMMITS = "https://api.github.com/repos/supabase/supabase/commits"
 
 # LiteLLM
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://localhost:4000")
@@ -44,7 +47,8 @@ MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
 MAIL_TO = [x.strip() for x in os.getenv("MAIL_TO", "").split(",") if x.strip()]
 
 # State e log
-STATE_FILE = "/tmp/supabase_comparison.json"
+STATE_DIR = os.getenv("STATE_DIR", os.path.expanduser("~/.supabase_monitor"))
+STATE_FILE = os.path.join(STATE_DIR, "version_info.json")
 LOG_FILE = os.getenv("LOG_FILE", "/var/log/supabase-monitor.log")
 CHANGELOG_EXTRACT_SIZE = 100
 
@@ -64,18 +68,32 @@ class SupabaseMonitor:
         self.ai_analysis = None
         self.errors = []
         self.has_changes = False
-
+        
+        # Version tracking
+        self.current_version_info = {}
+        self.github_commit_sha = ""
+        self.github_latest_tag = ""
+        
+        self._ensure_state_dir()
         self._validate_config()
+
+    def _ensure_state_dir(self):
+        """Crea la directory di stato se non esiste"""
+        Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+        print(f"  ✓ State directory: {STATE_DIR}")
 
     def _validate_config(self):
         """Valida la configurazione prima di iniziare"""
         print(f"\n[{datetime.now()}] Validando configurazione...")
 
+        if not os.path.exists(COMPOSE_DIR):
+            raise FileNotFoundError(f"Directory non trovata: {COMPOSE_DIR}")
+
         if not os.path.exists(COMPOSE_FILE):
             raise FileNotFoundError(f"docker-compose.yml non trovato: {COMPOSE_FILE}")
 
-        if COMPOSE_S3_FILE and not os.path.exists(COMPOSE_S3_FILE):
-            print(f"  ⚠️  docker-compose.s3.yml non trovato: {COMPOSE_S3_FILE}")
+        if not os.path.exists(ENV_FILE):
+            print(f"  ⚠️  .env non trovato: {ENV_FILE}")
 
         if not LITELLM_API_KEY:
             self.errors.append("⚠️  LITELLM_API_KEY non configurato")
@@ -88,6 +106,47 @@ class SupabaseMonitor:
 
         print(f"  ✓ Configurazione validata")
 
+    def _get_file_hash(self, filepath: str) -> str:
+        """Calcola SHA256 di un file"""
+        import hashlib
+        try:
+            with open(filepath, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()[:16]
+        except:
+            return "unknown"
+
+    def _get_git_commit_sha(self) -> str:
+        """Estrae il commit SHA dal repo locale (se esiste)"""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=COMPOSE_DIR,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()[:16]
+        except:
+            pass
+        return "unknown"
+
+    def _load_current_version(self):
+        """Carica lo stato della versione precedente"""
+        print(f"\n[{datetime.now()}] Caricando versione attuale...")
+
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, 'r') as f:
+                    self.current_version_info = json.load(f)
+                    print(f"  ✓ Versione precedente trovata: {self.current_version_info.get('last_update', 'sconosciuta')}")
+            except:
+                print(f"  ⚠️  State file corrotto, creando nuovo")
+                self.current_version_info = {}
+        else:
+            print(f"  ℹ️  Prima volta? State file non trovato")
+            self.current_version_info = {}
+
     def _load_local_compose(self):
         """Carica i docker-compose.yml e .env locali"""
         print(f"\n[{datetime.now()}] Caricando file locali...")
@@ -96,18 +155,17 @@ class SupabaseMonitor:
             self.local_compose = f.read()
         print(f"  ✓ {COMPOSE_FILE}")
 
-        if COMPOSE_S3_FILE and os.path.exists(COMPOSE_S3_FILE):
+        if os.path.exists(COMPOSE_S3_FILE):
             with open(COMPOSE_S3_FILE) as f:
                 self.local_compose_s3 = f.read()
             print(f"  ✓ {COMPOSE_S3_FILE}")
 
-        # Carica il file .env locale
         if os.path.exists(ENV_FILE):
             with open(ENV_FILE) as f:
                 self.local_env = f.read()
             print(f"  ✓ {ENV_FILE}")
         else:
-            print(f"  ⚠️  .env locale non trovato in {ENV_FILE}")
+            print(f"  ⚠️  .env non trovato in {ENV_FILE}")
 
     def _fetch_github_compose(self):
         """Scarica i docker-compose.yml e .env.example dal repo GitHub"""
@@ -140,6 +198,18 @@ class SupabaseMonitor:
         except Exception as e:
             print(f"  ⚠️  Errore scaricando .env.example: {e}")
 
+        # Estrai commit SHA dal repo GitHub
+        try:
+            resp = requests.get(f"{GITHUB_API_COMMITS}?per_page=1&sha=master", timeout=10)
+            resp.raise_for_status()
+            commits = resp.json()
+            if commits:
+                self.github_commit_sha = commits[0]['sha'][:16]
+                print(f"  ✓ GitHub commit: {self.github_commit_sha}")
+        except Exception as e:
+            print(f"  ⚠️  Errore ricevendo commit SHA: {e}")
+            self.github_commit_sha = "unknown"
+
         return True
 
     def _generate_diff(self, local: str, github: str, filename: str) -> str:
@@ -147,7 +217,6 @@ class SupabaseMonitor:
         local_lines = local.splitlines(keepends=True)
         github_lines = github.splitlines(keepends=True)
 
-        # Usa unified diff
         diff = difflib.unified_diff(
             local_lines,
             github_lines,
@@ -160,23 +229,16 @@ class SupabaseMonitor:
         return diff_text if diff_text else "Nessuna differenza trovata"
 
     def _fetch_changelog(self) -> str:
-        """Scarica il changelog da supabase.com"""
+        """Scarica il changelog"""
         print(f"\n[{datetime.now()}] Scaricando changelog...")
 
         try:
             resp = requests.get(CHANGELOG_URL, timeout=10)
             resp.raise_for_status()
-
-            # Estrai solo i contenuti testuali rilevanti
-            # Cerca la sezione con i changelog
             content = resp.text
-
-            # Estrai i primi N caratteri
             excerpt = content[:CHANGELOG_EXTRACT_SIZE * 1024]
-
             print(f"  ✓ Estratti {len(excerpt) // 1024}KB dal changelog")
             return excerpt
-
         except Exception as e:
             msg = f"Errore scaricando changelog: {e}"
             print(f"  ✗ {msg}")
@@ -185,6 +247,7 @@ class SupabaseMonitor:
 
     def compare(self) -> bool:
         """Esegui il confronto tra i file"""
+        self._load_current_version()
         self._load_local_compose()
 
         if not self._fetch_github_compose():
@@ -205,7 +268,6 @@ class SupabaseMonitor:
                 "docker-compose.s3.yml"
             )
 
-        # Confronta i file .env
         if self.local_env and self.github_env_example:
             self.env_diff = self._generate_diff(
                 self.local_env,
@@ -213,7 +275,6 @@ class SupabaseMonitor:
                 ".env"
             )
 
-        # Verifica se ci sono effettivamente differenze
         self.has_changes = (
             "Nessuna differenza" not in self.compose_diff or
             (self.compose_s3_diff and "Nessuna differenza" not in self.compose_s3_diff) or
@@ -222,8 +283,7 @@ class SupabaseMonitor:
 
         if self.has_changes:
             print(f"  ✓ Differenze trovate")
-            print(f"\nAnteprima diff (prime 20 linee):")
-            diff_lines = self.compose_diff.split('\n')[:20]
+            diff_lines = self.compose_diff.split('\n')[:15]
             for line in diff_lines:
                 print(f"    {line}")
         else:
@@ -239,11 +299,10 @@ class SupabaseMonitor:
 
         print(f"\n[{datetime.now()}] Analizzando con AI...")
 
-        # Limita il testo dei diff per evitare token troppi
         compose_diff_limited = self.compose_diff[:2000] if self.compose_diff else ""
         changelog_limited = self.changelog_excerpt[:1000] if self.changelog_excerpt else ""
 
-        prompt = f"""Analizza questo diff e rispondi ESCLUSIVAMENTE con JSON valido.
+        prompt = f"""Analizza questo aggiornamento Supabase e rispondi ESCLUSIVAMENTE con JSON valido.
 
 DIFF docker-compose.yml:
 {compose_diff_limited}
@@ -263,6 +322,7 @@ Rispondi con esattamente questo JSON:
   "migrazioni_necessarie": [],
   "livello_rischio": "BASSO",
   "raccomandazione": "procedere",
+  "stima_downtime_minuti": 5,
   "verdetto_finale": "analisi completata"
 }}"""
 
@@ -277,7 +337,7 @@ Rispondi con esattamente questo JSON:
                 "messages": [
                     {
                         "role": "system",
-                        "content": "Sei un esperto DevOps. Analizza i dati forniti e RESTITUISCI ESCLUSIVAMENTE UN JSON VALIDO nel tuo messaggio. Il JSON deve essere completo e valido. Non aggiungere testo prima o dopo il JSON."
+                        "content": "Sei un esperto DevOps. Analizza i dati forniti e RESTITUISCI ESCLUSIVAMENTE UN JSON VALIDO. Includi stima del downtime previsto."
                     },
                     {
                         "role": "user",
@@ -288,9 +348,6 @@ Rispondi con esattamente questo JSON:
                 "max_tokens": 4000
             }
 
-            print(f"  [DEBUG] Modello: {LITELLM_MODEL}")
-            print(f"  [DEBUG] max_tokens: 4000")
-
             resp = requests.post(
                 f"{LITELLM_BASE_URL}/v1/chat/completions",
                 json=payload,
@@ -298,50 +355,34 @@ Rispondi con esattamente questo JSON:
                 timeout=300
             )
 
-            print(f"  [DEBUG] Status code: {resp.status_code}")
-
             if resp.status_code == 200:
                 result = resp.json()
-                
-                # Prova a estrarre il content dalla struttura della risposta
                 message = result.get('choices', [{}])[0].get('message', {})
                 content = message.get('content', '').strip()
-                
-                # Se content è vuoto, prova reasoning_content (per modelli con reasoning)
-                if not content:
-                    print(f"  [DEBUG] Content vuoto, tentando reasoning_content...")
-                    content = message.get('reasoning_content', '').strip()
-                
-                print(f"  [DEBUG] Lunghezza content: {len(content)}")
-                if content:
-                    print(f"  [DEBUG] Primi 300 caratteri: {content[:300]}")
 
-                # Parsing JSON - estrai il primo { e ultimo }
+                if not content:
+                    content = message.get('reasoning_content', '').strip()
+
                 try:
                     if not content:
                         raise ValueError("Content is empty")
-                    
-                    # Trova la prima { e l'ultima }
+
                     start = content.find('{')
                     end = content.rfind('}') + 1
-                    
+
                     if start != -1 and end > start:
                         json_str = content[start:end]
-                        print(f"  [DEBUG] JSON estratto ({len(json_str)} char)")
                         self.ai_analysis = json.loads(json_str)
                         print(f"  ✓ JSON parsato correttamente")
                     else:
-                        print(f"  [DEBUG] Nessun JSON trovato in: {content[:200]}")
                         raise ValueError("No JSON found in response")
-                        
+
                 except (json.JSONDecodeError, ValueError) as e:
                     print(f"  ⚠️  Parsing JSON fallito: {e}")
-                    print(f"  [DEBUG] Tentativo di estrazione avanzata...")
-                    
-                    # Prova regex per estrarre JSON da testo
+
                     json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
                     matches = re.findall(json_pattern, content, re.DOTALL)
-                    
+
                     parsed = False
                     for match in matches:
                         try:
@@ -351,10 +392,8 @@ Rispondi con esattamente questo JSON:
                             break
                         except json.JSONDecodeError:
                             continue
-                    
+
                     if not parsed:
-                        print(f"  [DEBUG] Estrazione regex fallita, uso fallback")
-                        # Fallback: crea un'analisi vuota
                         self.ai_analysis = {
                             "versioni_cambiate": [],
                             "variabili_env_nuove": [],
@@ -363,15 +402,14 @@ Rispondi con esattamente questo JSON:
                             "migrazioni_necessarie": [],
                             "livello_rischio": "SCONOSCIUTO",
                             "raccomandazione": "Impossibile analizzare con AI",
+                            "stima_downtime_minuti": 0,
                             "verdetto_finale": f"Errore: {str(e)}"
                         }
 
-                print(f"  ✓ Analisi completata")
                 return self.ai_analysis
             else:
                 msg = f"Errore LiteLLM: {resp.status_code}"
                 print(f"  ✗ {msg}")
-                print(f"  [DEBUG] Response: {resp.text[:300]}")
                 self.errors.append(msg)
                 return None
 
@@ -381,273 +419,295 @@ Rispondi con esattamente questo JSON:
             self.errors.append(msg)
             return None
 
-    def _build_migration_guide(self) -> str:
-        """Genera una guida interattiva condizionata basata sull'analisi AI"""
+    def _build_runbook(self) -> str:
+        """Genera la RUNBOOK completa per l'aggiornamento manuale"""
         if not self.ai_analysis:
             return ""
-        
+
         analysis = self.ai_analysis
         risk_level = analysis.get("livello_rischio", "SCONOSCIUTO").upper()
+        downtime_est = analysis.get("stima_downtime_minuti", 5)
         
-        # Colori basati su risk level
         risk_color_map = {
-            "ALTO": "#d32f2f",      # Rosso
-            "MEDIO": "#f57c00",     # Arancione
-            "BASSO": "#388e3c"      # Verde
+            "ALTO": "#d32f2f",
+            "MEDIO": "#f57c00",
+            "BASSO": "#388e3c"
         }
         risk_emoji_map = {
             "ALTO": "🔴",
             "MEDIO": "🟠",
             "BASSO": "🟢"
         }
-        
+
         risk_color = risk_color_map.get(risk_level, "#9c27b0")
         risk_emoji = risk_emoji_map.get(risk_level, "❓")
-        
-        # Inizio della guida
+
+        current_sha = self.current_version_info.get('docker_compose_sha', 'unknown')
+        git_sha = self._get_git_commit_sha()
+
         html = f"""
-<div style="font-family: Arial, sans-serif; margin-top: 30px; border-top: 2px solid #ddd; padding-top: 20px;">
-    
-    <h3 style="color: #333;">📋 GUIDA ALL'AGGIORNAMENTO</h3>
-    
-    <!-- Risk Assessment -->
-    <div style="background-color: {risk_color}; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
-        <h4 style="margin: 0 0 10px 0;">{risk_emoji} LIVELLO RISCHIO: {risk_level}</h4>
-        <p style="margin: 0; font-size: 14px;">Raccomandazione: <strong>{analysis.get('raccomandazione', 'N/A').upper()}</strong></p>
-    </div>
-    
-    <!-- Versioni Cambiate -->
+<html style="font-family: monospace;">
+<body style="font-family: 'Courier New', monospace; line-height: 1.6; color: #333;">
+
+<div style="background-color: #f5f5f5; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
+    <h1 style="margin: 0 0 20px 0; color: #000;">SUPABASE SELF-HOSTED UPDATE RUNBOOK</h1>
+    <p style="margin: 5px 0;"><strong>Data Report:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <p style="margin: 5px 0;"><strong>Versione Attuale:</strong> sha={current_sha}</p>
+    <p style="margin: 5px 0;"><strong>Versione Disponibile:</strong> sha={self.github_commit_sha}</p>
+    <p style="margin: 5px 0;"><strong>Git Commit:</strong> {git_sha}</p>
+</div>
+
+<!-- HEADER ALERT -->
+<div style="background-color: {risk_color}; color: white; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
+    <h2 style="margin: 0 0 10px 0;">{risk_emoji} LIVELLO RISCHIO: {risk_level}</h2>
+    <p style="margin: 0 0 5px 0;"><strong>Raccomandazione:</strong> {analysis.get('raccomandazione', 'N/A').upper()}</p>
+    <p style="margin: 0;"><strong>Downtime Previsto:</strong> ~{downtime_est} minuti</p>
+</div>
+
+<!-- VERSIONI CAMBIATE -->
 """
         
         versioni = analysis.get("versioni_cambiate", [])
         if versioni:
             html += """
-    <div style="margin-bottom: 20px;">
-        <h4 style="color: #1976d2; margin-bottom: 10px;">📦 VERSIONI CAMBIATE</h4>
-        <ul style="background-color: #f5f5f5; padding: 15px 30px; border-left: 4px solid #1976d2; border-radius: 4px;">
-"""
-            for version in versioni:
-                html += f"<li style='margin-bottom: 8px;'><code>{version}</code></li>\n"
-            html += "</ul></div>\n"
-        
-        # Variabili Modificate
+<div style="margin-bottom: 30px; background-color: #f9f9f9; padding: 15px; border-left: 4px solid #1976d2; border-radius: 4px;">
+    <h3 style="margin: 0 0 10px 0; color: #1976d2;">📦 VERSIONI CAMBIATE</h3>
+    <pre style="margin: 0; overflow-x: auto; font-size: 12px;">"""
+            for v in versioni:
+                html += f"{v}\n"
+            html += "</pre></div>\n"
+
+        # VARIABILI MODIFICATE
         var_modificate = analysis.get("variabili_env_modificate", [])
-        if var_modificate:
-            html += """
-    <div style="margin-bottom: 20px;">
-        <h4 style="color: #1976d2; margin-bottom: 10px;">⚙️ VARIABILI D'AMBIENTE MODIFICATE</h4>
-        <table style="width: 100%; border-collapse: collapse; background-color: #f5f5f5;">
-            <thead>
-                <tr style="background-color: #1976d2; color: white;">
-                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Variabile</th>
-                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Prima</th>
-                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Dopo</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-            for var in var_modificate:
-                # Prova a parsare il formato "VAR: old -> new"
-                parts = var.split(" -> ")
-                if len(parts) == 2:
-                    before = parts[0].split(": ")[-1]
-                    after = parts[1]
-                    var_name = var.split(":")[0] if ":" in var else var.split(" ->")[0]
-                    html += f"""
-                <tr>
-                    <td style="padding: 10px; border: 1px solid #ddd;"><code>{var_name}</code></td>
-                    <td style="padding: 10px; border: 1px solid #ddd;"><code>{before}</code></td>
-                    <td style="padding: 10px; border: 1px solid #ddd;"><code style="color: #d32f2f; font-weight: bold;">{after}</code></td>
-                </tr>
-"""
-            html += """
-            </tbody>
-        </table>
-    </div>
-"""
+        var_nuove = analysis.get("variabili_env_nuove", [])
         
-        # Breaking Changes
+        if var_modificate or var_nuove:
+            html += """
+<div style="margin-bottom: 30px; background-color: #f9f9f9; padding: 15px; border-left: 4px solid #f57c00; border-radius: 4px;">
+    <h3 style="margin: 0 0 10px 0; color: #f57c00;">⚙️ VARIABILI D'AMBIENTE</h3>
+"""
+            if var_nuove:
+                html += "<p style='margin: 0 0 5px 0;'><strong>Nuove variabili richieste:</strong></p><pre style='margin: 0 0 10px 0; font-size: 12px; background-color: #fff3e0; padding: 10px; border-radius: 4px;'>"
+                for v in var_nuove:
+                    html += f"# Aggiungi al .env:\n{v}=VALORE_QUI\n"
+                html += "</pre>"
+            
+            if var_modificate:
+                html += "<p style='margin: 10px 0 5px 0;'><strong>Variabili modificate:</strong></p><pre style='margin: 0; font-size: 12px; background-color: #fff3e0; padding: 10px; border-radius: 4px;'>"
+                for v in var_modificate:
+                    html += f"{v}\n"
+                html += "</pre>"
+            
+            html += "</div>\n"
+
+        # BREAKING CHANGES
         breaking = analysis.get("breaking_changes", [])
         if breaking:
             html += """
-    <div style="margin-bottom: 20px;">
-        <h4 style="color: #d32f2f; margin-bottom: 10px;">🚨 BREAKING CHANGES - ATTENZIONE!</h4>
-        <div style="background-color: #ffebee; border-left: 4px solid #d32f2f; padding: 15px; border-radius: 4px;">
+<div style="margin-bottom: 30px; background-color: #ffebee; padding: 15px; border-left: 4px solid #d32f2f; border-radius: 4px;">
+    <h3 style="margin: 0 0 10px 0; color: #d32f2f;">🚨 BREAKING CHANGES - ATTENZIONE!</h3>
+    <ul style="margin: 0; padding-left: 20px;">
 """
             for change in breaking:
-                html += f"<p style='margin: 8px 0;'>⚠️ {change}</p>\n"
-            html += "</div></div>\n"
-        
-        # Migrazioni Necessarie
+                html += f"<li style='margin-bottom: 5px;'>{change}</li>\n"
+            html += """
+    </ul>
+</div>
+"""
+
+        # MIGRAZIONI NECESSARIE
         migrazioni = analysis.get("migrazioni_necessarie", [])
         if migrazioni:
             html += """
-    <div style="margin-bottom: 20px;">
-        <h4 style="color: #f57c00; margin-bottom: 10px;">✅ AZIONI NECESSARIE (CHECKLIST)</h4>
-        <div style="background-color: #fff3e0; border-left: 4px solid #f57c00; padding: 15px; border-radius: 4px;">
+<div style="margin-bottom: 30px; background-color: #f3e5f5; padding: 15px; border-left: 4px solid #6a1b9a; border-radius: 4px;">
+    <h3 style="margin: 0 0 10px 0; color: #6a1b9a;">🔧 AZIONI DURANTE L'AGGIORNAMENTO</h3>
+    <ol style="margin: 0; padding-left: 20px;">
 """
-            for i, migrazione in enumerate(migrazioni, 1):
-                html += f"""
-            <div style="margin-bottom: 10px; display: flex; align-items: start;">
-                <input type="checkbox" style="margin-right: 10px; margin-top: 2px; cursor: pointer;" id="step{i}">
-                <label for="step{i}" style="cursor: pointer; flex-grow: 1;">{migrazione}</label>
-            </div>
-"""
-            html += "</div></div>\n"
-        
-        # Guida Condizionata Step-by-Step
-        html += """
-    <div style="margin-bottom: 20px;">
-        <h4 style="color: #388e3c; margin-bottom: 10px;">🚀 GUIDA STEP-BY-STEP</h4>
-        <div style="background-color: #f1f8e9; border-left: 4px solid #388e3c; padding: 15px; border-radius: 4px;">
-            <ol style="margin: 0; padding-left: 20px;">
-"""
-        
-        # Step condizionati
-        if var_modificate:
+            for mig in migrazioni:
+                html += f"<li style='margin-bottom: 8px;'>{mig}</li>\n"
             html += """
-                <li style="margin-bottom: 12px;">
-                    <strong>Aggiorna il file .env</strong><br>
-                    <span style="color: #666; font-size: 12px;">Le seguenti variabili devono essere aggiornate o aggiunte:</span>
-                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
-"""
-            for var in var_modificate:
-                if "${" in var:  # Nuove variabili da ambiente
-                    var_name = var.split("(")[0].strip() if "(" in var else var
-                    html += f"# Aggiungi: {var_name}=valore_qui\n"
-            html += """
-                    </pre>
-                </li>
-"""
-        
-        if breaking:
-            html += """
-                <li style="margin-bottom: 12px;">
-                    <strong>Backup della configurazione attuale</strong><br>
-                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
-cp docker-compose.yml docker-compose.yml.bak
-cp .env .env.bak
-                    </pre>
-                </li>
-"""
-        
-        html += """
-                <li style="margin-bottom: 12px;">
-                    <strong>Scarica le nuove immagini</strong><br>
-                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
-docker compose pull
-                    </pre>
-                </li>
-                
-                <li style="margin-bottom: 12px;">
-                    <strong>Verifica la configurazione</strong><br>
-                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
-docker compose config --quiet
-                    </pre>
-                </li>
-                
-                <li style="margin-bottom: 12px;">
-                    <strong>Avvia i nuovi container</strong><br>
-                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
-docker compose down
-docker compose up -d
-                    </pre>
-                </li>
-                
-                <li style="margin-bottom: 12px;">
-                    <strong>Verifica lo stato</strong><br>
-                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
-docker compose ps
-docker compose logs -f --tail=50
-                    </pre>
-                </li>
-            </ol>
-        </div>
-    </div>
-"""
-        
-        # Prompt per Copilot Agent
-        html += """
-    <div style="margin-bottom: 20px;">
-        <h4 style="color: #6a1b9a; margin-bottom: 10px;">🤖 PROMPT PER AUTOMAZIONE (Copilot Agent)</h4>
-        <details style="background-color: #f3e5f5; border-left: 4px solid #6a1b9a; padding: 15px; border-radius: 4px; cursor: pointer;">
-            <summary style="font-weight: bold; cursor: pointer;">Clicca per espandere il prompt da usare con Copilot Agent</summary>
-            <pre style="background-color: #ede7f6; padding: 12px; border-radius: 4px; overflow-x: auto; margin-top: 10px; font-size: 11px; white-space: pre-wrap; word-wrap: break-word;">
-"""
-        
-        # Generazione del prompt per l'agente
-        agent_prompt = self._generate_agent_prompt(analysis)
-        html += agent_prompt.replace("<", "&lt;").replace(">", "&gt;")
-        
-        html += """
-            </pre>
-        </details>
-    </div>
-
+    </ol>
 </div>
 """
-        
+
+        # RUNBOOK COMPLETA
+        html += """
+<div style="margin-bottom: 30px; background-color: #e8f5e9; padding: 15px; border-left: 4px solid #388e3c; border-radius: 4px;">
+    <h3 style="margin: 0 0 15px 0; color: #388e3c;">📋 ISTRUZIONI PASSO-PASSO</h3>
+    
+    <h4 style="margin: 15px 0 10px 0; color: #1976d2;">FASE 0: PRE-UPDATE CHECKLIST</h4>
+    <pre style="background-color: white; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #ddd;">
+□ Verificare spazio disco (almeno 10GB liberi)
+  $ df -h """ + COMPOSE_DIR + """
+
+□ Backup database PostgreSQL
+  $ cd """ + COMPOSE_DIR + """
+  $ docker compose exec postgres pg_dump -U postgres -v > backup-$(date +%Y-%m-%d).sql
+  $ du -h backup-*.sql  # Verifica peso
+
+□ Backup file configurazione
+  $ cp docker-compose.yml docker-compose.yml.backup-$(date +%Y-%m-%d)
+  $ cp .env .env.backup-$(date +%Y-%m-%d)
+  $ tar -czf backup-$(date +%Y-%m-%d).tar.gz docker-compose.yml.backup-* .env.backup-*
+
+□ Documenta versione attuale
+  $ git log --oneline -1
+  $ git rev-parse HEAD
+
+□ Annuncia downtime (""" + str(downtime_est) + """ minuti previsti)
+    </pre>
+
+    <h4 style="margin: 15px 0 10px 0; color: #1976d2;">FASE 1: UPDATE REPOSITORY</h4>
+    <pre style="background-color: white; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #ddd;">
+$ cd """ + COMPOSE_DIR + """
+
+# STEP 1: Salva personalizzazioni locali (se esistono)
+$ git stash
+
+# STEP 2: Verifica cosa cambia PRIMA di pullare
+$ git fetch origin master
+$ git diff HEAD origin/master --stat  # Vedi quali file cambiano
+$ git diff HEAD origin/master -- docker-compose.yml | head -50  # Vedi le differenze
+
+# ❌ Se vedi cose strane, STOP qui e investigare
+
+# STEP 3: Esegui il pull
+$ git pull origin master
+ASPETTA il completamento
+
+# Verifica che il pull sia andato bene:
+$ git log --oneline -1  # Deve mostrare un commit più recente
+
+# ✅ Conferma: git diff HEAD~1 -- docker-compose.yml deve mostrare cambiamenti
+    </pre>
+
+    <h4 style="margin: 15px 0 10px 0; color: #1976d2;">FASE 2: VALIDAZIONE FILE</h4>
+    <pre style="background-color: white; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #ddd;">
+# STEP 1: Controlla nuove variabili .env necessarie
+$ diff -u .env .env.example | grep "^+" | grep -v "^+++" | head -20
+
+# STEP 2: Copia le nuove variabili nel tuo .env
+$ cat .env.example | grep -E "^[A-Z_]+" | grep -v "^#" > /tmp/env_new.txt
+# Poi MANUALMENTE aggiungi le variabili nuove dal file sopra al tuo .env
+
+# STEP 3: Valida la sintassi YAML
+$ docker compose config --quiet
+# ✅ Se NON vedi errori, puoi proseguire
+# ❌ Se vedi errori, NON proseguire, investigare
+
+# STEP 4: Preview (facoltativo, ma consigliato)
+$ docker compose config | head -100
+    </pre>
+
+    <h4 style="margin: 15px 0 10px 0; color: #1976d2;">FASE 3: AGGIORNAMENTO CONTAINER</h4>
+    <pre style="background-color: white; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #ddd;">
+# ⏱️ DA QUI IN POI: ~""" + str(downtime_est) + """ MINUTI DI DOWNTIME
+
+# STEP 1: Scarica le nuove immagini (container ancora UP)
+$ docker compose pull
+# ⏱️ Questo potrebbe durare 5-10 minuti (dipende dalla connessione)
+
+# STEP 2: Stop graceful - dai tempo ai container di terminare connessioni
+$ docker compose down
+# ✅ Verifiche:
+$ docker ps  # Deve essere VUOTO
+
+# STEP 3: Riavvia
+$ docker compose up -d
+
+# ⏱️ ASPETTA 30 SECONDI PER STABILIZZARSI
+
+# Verifica che sia partito:
+$ docker compose ps
+# ✅ Tutti i container devono essere UP
+    </pre>
+
+    <h4 style="margin: 15px 0 10px 0; color: #1976d2;">FASE 4: POST-UPDATE VALIDATION</h4>
+    <pre style="background-color: white; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #ddd;">
+# STEP 1: Verifica container status
+$ docker compose ps
+# ✅ Tutti devono essere UP? BENE
+# ❌ Qualcuno DOWN? Vedi ROLLBACK
+
+# STEP 2: Controlla log (primissimi 50 righe)
+$ docker compose logs --tail=50
+# ❌ Errori critici? Vedi ROLLBACK
+
+# STEP 3: Healthcheck di base
+$ curl -s http://localhost:9999/auth/v1/health | jq .
+# ✅ Deve rispondere con JSON
+
+$ curl -s http://localhost:8000/health | jq .
+# ✅ Deve rispondere
+
+$ docker compose exec postgres psql -U postgres -c "SELECT version();"
+# ✅ Deve mostrare versione PostgreSQL
+
+# STEP 4: Verifica applicazioni critiche
+# - Prova ad accedere a Supabase Studio: http://localhost:3000
+# - Prova a fare un login/signup
+# - Verifica che i dati siano visibili
+
+# ✅ SE TUTTO OK:
+$ echo "Update completed successfully" >> /var/log/supabase-update.log
+    </pre>
+
+    <h4 style="margin: 15px 0 10px 0; color: #d32f2f;">FASE 5: ROLLBACK (SE QUALCOSA VA MALE)</h4>
+    <pre style="background-color: #ffebee; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #d32f2f;">
+# ⚠️ ESEGUI SOLO SE L'UPDATE HA PROBLEMI CRITICI
+
+# STEP 1: Torna al commit precedente
+$ git reset --hard HEAD~1
+
+# STEP 2: Riavvia container con codice vecchio
+$ docker compose down
+$ docker compose up -d
+
+# STEP 3: Verifica che è tornato ok
+$ docker compose ps
+$ docker compose logs --tail=20
+
+# STEP 4: Ripristina database se necessario
+$ docker compose exec postgres psql -U postgres -c "DROP DATABASE postgres;"
+$ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
+
+# STEP 5: Documenta il problema e apri issue su GitHub
+    </pre>
+
+</div>
+
+<!-- FINE RUNBOOK -->
+
+<hr style="border: 1px solid #ddd; margin: 30px 0;">
+
+<div style="background-color: #f0f0f0; padding: 15px; border-radius: 8px; margin-bottom: 30px;">
+    <h3 style="margin: 0 0 10px 0; color: #666;">📞 SUPPORT & RESOURCES</h3>
+    <ul style="margin: 0; padding-left: 20px; color: #666;">
+        <li><strong>Supabase Docker Docs:</strong> <a href="https://github.com/supabase/supabase/tree/master/docker">github.com/supabase/supabase/tree/master/docker</a></li>
+        <li><strong>Changelog:</strong> <a href="https://github.com/supabase/supabase/blob/master/docker/CHANGELOG.md">CHANGELOG.md</a></li>
+        <li><strong>Issues:</strong> <a href="https://github.com/supabase/supabase/issues">github.com/supabase/supabase/issues</a></li>
+        <li><strong>Community:</strong> <a href="https://discord.supabase.com">discord.supabase.com</a></li>
+    </ul>
+</div>
+
+<div style="background-color: #fffacd; padding: 15px; border-radius: 8px; border-left: 4px solid #f57c00;">
+    <h4 style="margin: 0 0 10px 0; color: #f57c00;">⚠️ CHECKLIST FINALE PRIMA DI INIZIARE</h4>
+    <ul style="margin: 0; padding-left: 20px;">
+        <li>✓ Backup completo eseguito e testato</li>
+        <li>✓ Team notificato del downtime previsto</li>
+        <li>✓ Ambiente TEST aggiornato con successo (se disponibile)</li>
+        <li>✓ Hai tutto il tempo necessario per il rollback se necessario</li>
+        <li>✓ Hai questa runbook stampata o salvata</li>
+    </ul>
+</div>
+
+</body>
+</html>
+"""
         return html
 
-    def _generate_agent_prompt(self, analysis: Dict) -> str:
-        """Genera un prompt strutturato per Copilot Agent per automatizzare la migrazione"""
-        
-        versioni = analysis.get("versioni_cambiate", [])
-        var_modificate = analysis.get("variabili_env_modificate", [])
-        breaking = analysis.get("breaking_changes", [])
-        migrazioni = analysis.get("migrazioni_necessarie", [])
-        risk = analysis.get("livello_rischio", "MEDIO")
-        
-        prompt = f"""
-## Supabase Self-Hosted Update Automation
-
-Devo eseguire un aggiornamento di Supabase Self-Hosted dal mio ambiente di produzione.
-
-### Contesto
-- **Livello di Rischio**: {risk}
-- **Repository**: nik2208/supabase-update-monitor
-- **Ambiente**: Produzione
-
-### Cambiamenti Rilevati
-
-**Versioni Cambiate:**
-{chr(10).join(f"- {v}" for v in versioni)}
-
-**Variabili Modificate:**
-{chr(10).join(f"- {v}" for v in var_modificate)}
-
-**Breaking Changes:**
-{chr(10).join(f"- {b}" for b in breaking)}
-
-### Azioni Richieste
-
-1. **Backup**: Crea un backup della configurazione attuale (docker-compose.yml, .env)
-2. **Aggiornamento variabili .env**: Aggiorna/aggiungi le seguenti variabili:
-   {chr(10).join(f'   - {v.split(":")[0]}' for v in var_modificate)}
-3. **Update container**: 
-   - docker compose pull
-   - docker compose down
-   - docker compose up -d
-4. **Verifiche post-update**:
-   - Verifica che tutti i container siano running
-   - Controlla i log per errori
-   - Verifica la connettività ai servizi principali
-5. **Test funzionali**: Valida che i servizi critici (auth, API, storage) funzionino correttamente
-
-### Attenzioni Importanti
-
-{chr(10).join(f"- {b}" for b in breaking)}
-
-**Aiutami a:**
-- Creare uno script bash automatizzato per questi step
-- Implementare controlli di salute (healthchecks) per validare l'aggiornamento
-- Generare un rollback plan nel caso qualcosa fallisca
-"""
-        
-        return prompt
-
     def send_email(self):
-        """Invia email con i risultati"""
+        """Invia email con la runbook completa"""
         if not MAIL_TO or not SMTP_USER:
             print(f"⚠️  Email non configurata, skippando invio")
             return
@@ -656,70 +716,33 @@ Devo eseguire un aggiornamento di Supabase Self-Hosted dal mio ambiente di produ
 
         try:
             msg = MIMEMultipart("alternative")
-            status = "🔴 AGGIORNAMENTI" if self.has_changes else "🟢 ALLINEATO"
+            status = "🔴 AGGIORNAMENTO DISPONIBILE" if self.has_changes else "🟢 ALLINEATO"
             msg["Subject"] = f"{status} - Supabase Self-Hosted Monitor"
             msg["From"] = MAIL_FROM
             msg["To"] = ", ".join(MAIL_TO)
 
-            html_content = f"""
-            <html>
-              <body style="font-family: Arial, sans-serif;">
-                <h2>{status} - Supabase Self-Hosted</h2>
-                <p><strong>Data:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-
-                <h3>📊 Stato Confronto</h3>
-                <p>
-                    {'✅ Repository GitHub è allineato con la configurazione locale' if not self.has_changes else '⚠️ Sono presenti differenze tra la configurazione locale e GitHub master'}
-                </p>
-
-                <h3>📝 Diff docker-compose.yml</h3>
-                <pre style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px;">
-{self.compose_diff}
-                </pre>
-            """
-
-            if self.compose_s3_diff:
-                html_content += f"""
-                <h3>📝 Diff docker-compose.s3.yml</h3>
-                <pre style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px;">
-{self.compose_s3_diff}
-                </pre>
-                """
-
-            html_content += """
-                <h3>🔐 Diff .env (Locale vs .env.example)</h3>
-            """
-
-            if self.env_diff:
-                html_content += f"""
-                <pre style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px;">
-{self.env_diff}
-                </pre>
-                """
+            if self.has_changes:
+                html_content = self._build_runbook()
             else:
-                html_content += "<p>✅ File .env allineato con .env.example</p>"
-
-            # Sezione Analisi AI con guida interattiva
-            if self.ai_analysis:
-                html_content += self._build_migration_guide()
-            else:
-                html_content += "<p>⚠️ Analisi AI non disponibile</p>"
-
-            html_content += """
-                <hr>
-                <p style="color: #666; font-size: 12px;">
-                  📚 Repo: <a href="https://github.com/supabase/supabase">supabase/supabase</a><br>
-                  📋 Changelog: <a href="https://supabase.com/changelog">supabase.com/changelog</a><br>
-                  ✓ Fai sempre un backup prima di aggiornare<br>
-                  ✓ Testa in staging environment
-                </p>
-              </body>
-            </html>
-            """
+                html_content = f"""
+<html>
+<body style="font-family: Arial, sans-serif;">
+    <h2>✅ SUPABASE ALLINEATO</h2>
+    <p><strong>Data:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <p>La configurazione locale è allineata con il repository GitHub master.</p>
+    <p>Nessun aggiornamento necessario al momento.</p>
+    
+    <hr>
+    <p style="color: #666; font-size: 12px;">
+        Versione Attuale: {self.current_version_info.get('docker_compose_sha', 'unknown')}<br>
+        Versione GitHub: {self.github_commit_sha}
+    </p>
+</body>
+</html>
+"""
 
             msg.attach(MIMEText(html_content, "html"))
 
-            # Invia email
             with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
                 server.starttls()
                 server.login(SMTP_USER, SMTP_PASSWORD)
@@ -733,15 +756,23 @@ Devo eseguire un aggiornamento di Supabase Self-Hosted dal mio ambiente di produ
             self.errors.append(msg)
 
     def save_state(self):
-        """Salva lo stato per il prossimo controllo"""
+        """Salva lo stato della versione corrente"""
         state = {
-            "timestamp": datetime.now().isoformat(),
+            "last_update": datetime.now().isoformat(),
+            "docker_compose_sha": self._get_file_hash(COMPOSE_FILE),
+            "git_commit": self._get_git_commit_sha(),
+            "github_commit": self.github_commit_sha,
             "has_changes": self.has_changes,
             "compose_diff_lines": len(self.compose_diff.split('\n')),
-            "errors": self.errors
         }
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
+        
+        try:
+            with open(STATE_FILE, 'w') as f:
+                json.dump(state, f, indent=2)
+            print(f"\n  ✓ Stato salvato: {STATE_FILE}")
+        except Exception as e:
+            print(f"  ✗ Errore salvando stato: {e}")
+            self.errors.append(f"Errore salvando stato: {e}")
 
     def print_summary(self):
         """Stampa un riassunto con eventuali errori"""
@@ -753,19 +784,16 @@ Devo eseguire un aggiornamento di Supabase Self-Hosted dal mio ambiente di produ
     def run(self):
         """Esegui il ciclo completo"""
         print("=" * 70)
-        print("Supabase Self-Hosted Update Monitor v2")
+        print("Supabase Self-Hosted Update Monitor v3")
         print("=" * 70)
 
-        # Scarica il changelog
         self.changelog_excerpt = self._fetch_changelog()
 
-        # Confronta i file
         if not self.compare():
             print("\n✗ Errore durante il confronto dei file")
             self.print_summary()
             return
 
-        # Se non ci sono cambipamenti, comunica e esci
         if not self.has_changes:
             print("\n✓ Configurazione allineata con GitHub master")
             self.print_summary()
@@ -774,29 +802,27 @@ Devo eseguire un aggiornamento di Supabase Self-Hosted dal mio ambiente di produ
             self.save_state()
             return
 
-        # Analizza con AI
+        print("\n🔴 AGGIORNAMENTI DISPONIBILI - Generando runbook...")
+
         self.analyze_with_ai()
 
-        # Invia email
         if MAIL_TO and SMTP_USER:
             self.send_email()
 
-        # Salva lo stato
         self.save_state()
 
         self.print_summary()
-        print("\n✓ Monitoraggio completato")
+        print("\n✓ Monitoraggio completato - Runbook inviata")
 
 
 if __name__ == "__main__":
     try:
         print("=" * 70)
-        print("Supabase Self-Hosted Update Monitor v2")
+        print("Supabase Self-Hosted Update Monitor v3")
         print("=" * 70)
-        print(f"\nVariabili di configurazione:")
-        print(f"  COMPOSE_FILE: {COMPOSE_FILE}")
-        print(f"  ENV_FILE: {ENV_FILE}")
-        print(f"  LITELLM_BASE_URL: {LITELLM_BASE_URL}")
+        print(f"\nConfigurazione:")
+        print(f"  COMPOSE_DIR: {COMPOSE_DIR}")
+        print(f"  STATE_DIR: {STATE_DIR}")
         print(f"  LITELLM_MODEL: {LITELLM_MODEL}")
         print(f"  MAIL_TO: {MAIL_TO}")
         
