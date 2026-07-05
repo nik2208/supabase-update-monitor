@@ -302,17 +302,45 @@ Rispondi SOLO con questo JSON, senza nessun testo aggiuntivo prima o dopo:
             )
 
             print(f"  [DEBUG] Status code: {resp.status_code}")
-
+            print(f"  [DEBUG] Response headers: {dict(resp.headers)}")
+            
+            # Dump della risposta JSON completa per debug
+            print(f"  [DEBUG] Response body (raw): {resp.text[:1000]}")
+            
             if resp.status_code == 200:
-                result = resp.json()
-                content = result['choices'][0]['message']['content'].strip()
+                try:
+                    result = resp.json()
+                    print(f"  [DEBUG] Response JSON parsed: {json.dumps(result, indent=2)[:500]}")
+                    
+                    # Naviga la struttura della risposta
+                    if 'choices' in result and len(result['choices']) > 0:
+                        choice = result['choices'][0]
+                        if 'message' in choice and 'content' in choice['message']:
+                            content = choice['message']['content'].strip()
+                        else:
+                            print(f"  [DEBUG] Struttura 'choices' inaspettata: {json.dumps(choice, indent=2)[:300]}")
+                            content = ""
+                    else:
+                        print(f"  [DEBUG] Response non contiene 'choices': {list(result.keys())}")
+                        content = ""
+                    
+                except json.JSONDecodeError as je:
+                    print(f"  ⚠️  Errore parsing JSON response: {je}")
+                    print(f"  [DEBUG] Raw response: {resp.text[:500]}")
+                    content = ""
 
                 print(f"  [DEBUG] Lunghezza risposta: {len(content)} caratteri")
-                print(f"  [DEBUG] Primi 200 caratteri: {content[:200]}")
-                print(f"  [DEBUG] Ultimi 200 caratteri: {content[-200:]}")
+                if content:
+                    print(f"  [DEBUG] Primi 200 caratteri: {content[:200]}")
+                    print(f"  [DEBUG] Ultimi 200 caratteri: {content[-200:]}")
+                else:
+                    print(f"  [DEBUG] Content è vuoto!")
 
                 # Parsing JSON - estrai il primo { e ultimo }
                 try:
+                    if not content:
+                        raise ValueError("Content is empty")
+                    
                     # Trova la prima { e l'ultima }
                     start = content.find('{')
                     end = content.rfind('}') + 1
@@ -333,7 +361,7 @@ Rispondi SOLO con questo JSON, senza nessun testo aggiuntivo prima o dopo:
                 print(f"  ✓ Analisi completata")
                 return self.ai_analysis
             else:
-                msg = f"Errore LiteLLM: {resp.status_code} - {resp.text[:200]}"
+                msg = f"Errore LiteLLM: {resp.status_code}"
                 print(f"  ✗ {msg}")
                 print(f"  [DEBUG] Response body: {resp.text[:500]}")
                 self.errors.append(msg)
