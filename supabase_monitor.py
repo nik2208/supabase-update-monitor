@@ -1,23 +1,4 @@
-def _load_local_compose(self):
-        """Carica i docker-compose.yml e .env locali"""
-        print(f"\n[{datetime.now()}] Caricando file locali...")
-
-        with open(COMPOSE_FILE) as f:
-            self.local_compose = f.read()
-        print(f"  ✓ {COMPOSE_FILE}")
-
-        if COMPOSE_S3_FILE and os.path.exists(COMPOSE_S3_FILE):
-            with open(COMPOSE_S3_FILE) as f:
-                self.local_compose_s3 = f.read()
-            print(f"  ✓ {COMPOSE_S3_FILE}")
-
-        # Carica il file .env locale
-        if os.path.exists(ENV_FILE):
-            with open(ENV_FILE) as f:
-                self.local_env = f.read()
-            print(f"  ✓ {ENV_FILE}")
-        else:
-            print(f"  ⚠️  .env locale non trovato in {ENV_FILE}")#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Supabase Self-Hosted Update Monitor - v2
 Confronta docker-compose.yml locali con quelli del repo GitHub ufficiale
@@ -108,7 +89,7 @@ class SupabaseMonitor:
         print(f"  ✓ Configurazione validata")
 
     def _load_local_compose(self):
-        """Carica i docker-compose.yml locali"""
+        """Carica i docker-compose.yml e .env locali"""
         print(f"\n[{datetime.now()}] Caricando file locali...")
 
         with open(COMPOSE_FILE) as f:
@@ -119,6 +100,14 @@ class SupabaseMonitor:
             with open(COMPOSE_S3_FILE) as f:
                 self.local_compose_s3 = f.read()
             print(f"  ✓ {COMPOSE_S3_FILE}")
+
+        # Carica il file .env locale
+        if os.path.exists(ENV_FILE):
+            with open(ENV_FILE) as f:
+                self.local_env = f.read()
+            print(f"  ✓ {ENV_FILE}")
+        else:
+            print(f"  ⚠️  .env locale non trovato in {ENV_FILE}")
 
     def _fetch_github_compose(self):
         """Scarica i docker-compose.yml e .env.example dal repo GitHub"""
@@ -250,30 +239,34 @@ class SupabaseMonitor:
 
         print(f"\n[{datetime.now()}] Analizzando con AI...")
 
-        prompt = f"""Sei un esperto DevOps. Analizza SOLO i dati forniti e rispondi in JSON puro, SENZA testo aggiuntivo.
+        # Limita il testo dei diff per evitare token troppi
+        compose_diff_limited = self.compose_diff[:3000] if self.compose_diff else ""
+        changelog_limited = self.changelog_excerpt[:2000] if self.changelog_excerpt else ""
 
-DIFF docker-compose.yml:
-{self.compose_diff}
+        prompt = f"""Sei un esperto DevOps. Analizza i dati forniti e rispondi ESCLUSIVAMENTE in JSON valido.
+
+DIFF docker-compose.yml (primi 3000 caratteri):
+{compose_diff_limited}
 
 DIFF docker-compose.s3.yml:
-{self.compose_s3_diff if self.compose_s3_diff else "Identico"}
+{self.compose_s3_diff[:1000] if self.compose_s3_diff else "Identico"}
 
-DIFF .env:
-{self.env_diff if self.env_diff else "Identico"}
+DIFF .env (se presente):
+{self.env_diff[:1000] if self.env_diff else "Identico o non disponibile"}
 
-CHANGELOG:
-{self.changelog_excerpt}
+CHANGELOG (estratto):
+{changelog_limited}
 
-Rispondi con QUESTO JSON (niente altro):
+Rispondi SOLO con questo JSON, senza nessun testo aggiuntivo prima o dopo:
 {{
-  "versioni_cambiate": ["servizio: old -> new", ...],
-  "variabili_env_nuove": ["VAR1", "VAR2", ...],
-  "variabili_env_modificate": ["VAR1", ...],
-  "breaking_changes": ["descrizione breaking change", ...],
-  "migrazioni_necessarie": ["descrizione migrazione", ...],
-  "livello_rischio": "BASSO|MEDIO|ALTO",
-  "raccomandazione": "procedere subito|testare prima|attendere fix",
-  "verdetto_finale": "breve frase di conclusione"
+  "versioni_cambiate": ["servizio: old -> new"],
+  "variabili_env_nuove": ["VAR1"],
+  "variabili_env_modificate": ["VAR1"],
+  "breaking_changes": ["descrizione"],
+  "migrazioni_necessarie": ["descrizione"],
+  "livello_rischio": "BASSO",
+  "raccomandazione": "procedere",
+  "verdetto_finale": "conclusione"
 }}"""
 
         try:
@@ -287,16 +280,19 @@ Rispondi con QUESTO JSON (niente altro):
                 "messages": [
                     {
                         "role": "system",
-                        "content": "Sei un esperto DevOps specializzato in Supabase. Analizza diff e changelog con attenzione ai breaking changes e rischi di produzione. Sii conciso e pratico."
+                        "content": "Rispondi ESCLUSIVAMENTE con JSON valido, niente altro. Non aggiungere testo prima o dopo il JSON."
                     },
                     {
                         "role": "user",
                         "content": prompt
                     }
                 ],
-                "temperature": 0.7,
+                "temperature": 0.3,
                 "max_tokens": 1000
             }
+
+            print(f"  [DEBUG] Modello: {LITELLM_MODEL}")
+            print(f"  [DEBUG] URL: {LITELLM_BASE_URL}/v1/chat/completions")
 
             resp = requests.post(
                 f"{LITELLM_BASE_URL}/v1/chat/completions",
@@ -305,9 +301,15 @@ Rispondi con QUESTO JSON (niente altro):
                 timeout=300
             )
 
+            print(f"  [DEBUG] Status code: {resp.status_code}")
+
             if resp.status_code == 200:
                 result = resp.json()
                 content = result['choices'][0]['message']['content'].strip()
+
+                print(f"  [DEBUG] Lunghezza risposta: {len(content)} caratteri")
+                print(f"  [DEBUG] Primi 200 caratteri: {content[:200]}")
+                print(f"  [DEBUG] Ultimi 200 caratteri: {content[-200:]}")
 
                 # Parsing JSON - estrai il primo { e ultimo }
                 try:
@@ -317,7 +319,9 @@ Rispondi con QUESTO JSON (niente altro):
                     
                     if start != -1 and end > start:
                         json_str = content[start:end]
+                        print(f"  [DEBUG] JSON estratto ({len(json_str)} char): {json_str[:300]}")
                         self.ai_analysis = json.loads(json_str)
+                        print(f"  ✓ JSON parsato correttamente")
                     else:
                         raise ValueError("No JSON found in response")
                         
@@ -331,12 +335,15 @@ Rispondi con QUESTO JSON (niente altro):
             else:
                 msg = f"Errore LiteLLM: {resp.status_code} - {resp.text[:200]}"
                 print(f"  ✗ {msg}")
+                print(f"  [DEBUG] Response body: {resp.text[:500]}")
                 self.errors.append(msg)
                 return None
 
         except Exception as e:
             msg = f"Errore durante analisi AI: {e}"
             print(f"  ✗ {msg}")
+            import traceback
+            traceback.print_exc()
             self.errors.append(msg)
             return None
 
@@ -498,6 +505,7 @@ if __name__ == "__main__":
         print(f"  COMPOSE_FILE: {COMPOSE_FILE}")
         print(f"  ENV_FILE: {ENV_FILE}")
         print(f"  LITELLM_BASE_URL: {LITELLM_BASE_URL}")
+        print(f"  LITELLM_MODEL: {LITELLM_MODEL}")
         print(f"  MAIL_TO: {MAIL_TO}")
         
         monitor = SupabaseMonitor()
