@@ -285,11 +285,11 @@ Rispondi con esattamente questo JSON:
                     }
                 ],
                 "temperature": 0.2,
-                "max_tokens": 2000  # Aumentato per permettere ragionamento + JSON
+                "max_tokens": 4000  # Aumentato significativamente
             }
 
             print(f"  [DEBUG] Modello: {LITELLM_MODEL}")
-            print(f"  [DEBUG] max_tokens: 2000")
+            print(f"  [DEBUG] max_tokens: 4000")
 
             resp = requests.post(
                 f"{LITELLM_BASE_URL}/v1/chat/completions",
@@ -327,6 +327,7 @@ Rispondi con esattamente questo JSON:
                     
                     if start != -1 and end > start:
                         json_str = content[start:end]
+                        print(f"  [DEBUG] JSON estratto ({len(json_str)} char)")
                         self.ai_analysis = json.loads(json_str)
                         print(f"  ✓ JSON parsato correttamente")
                     else:
@@ -335,17 +336,35 @@ Rispondi con esattamente questo JSON:
                         
                 except (json.JSONDecodeError, ValueError) as e:
                     print(f"  ⚠️  Parsing JSON fallito: {e}")
-                    # Fallback: crea un'analisi vuota
-                    self.ai_analysis = {
-                        "versioni_cambiate": [],
-                        "variabili_env_nuove": [],
-                        "variabili_env_modificate": [],
-                        "breaking_changes": [],
-                        "migrazioni_necessarie": [],
-                        "livello_rischio": "SCONOSCIUTO",
-                        "raccomandazione": "Impossibile analizzare con AI",
-                        "verdetto_finale": f"Errore: {str(e)}"
-                    }
+                    print(f"  [DEBUG] Tentativo di estrazione avanzata...")
+                    
+                    # Prova regex per estrarre JSON da testo
+                    json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+                    matches = re.findall(json_pattern, content, re.DOTALL)
+                    
+                    parsed = False
+                    for match in matches:
+                        try:
+                            self.ai_analysis = json.loads(match)
+                            print(f"  ✓ JSON parsato da regex")
+                            parsed = True
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    if not parsed:
+                        print(f"  [DEBUG] Estrazione regex fallita, uso fallback")
+                        # Fallback: crea un'analisi vuota
+                        self.ai_analysis = {
+                            "versioni_cambiate": [],
+                            "variabili_env_nuove": [],
+                            "variabili_env_modificate": [],
+                            "breaking_changes": [],
+                            "migrazioni_necessarie": [],
+                            "livello_rischio": "SCONOSCIUTO",
+                            "raccomandazione": "Impossibile analizzare con AI",
+                            "verdetto_finale": f"Errore: {str(e)}"
+                        }
 
                 print(f"  ✓ Analisi completata")
                 return self.ai_analysis
