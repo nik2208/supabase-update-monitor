@@ -285,7 +285,7 @@ Rispondi con esattamente questo JSON:
                     }
                 ],
                 "temperature": 0.2,
-                "max_tokens": 4000  # Aumentato significativamente
+                "max_tokens": 4000
             }
 
             print(f"  [DEBUG] Modello: {LITELLM_MODEL}")
@@ -381,6 +381,271 @@ Rispondi con esattamente questo JSON:
             self.errors.append(msg)
             return None
 
+    def _build_migration_guide(self) -> str:
+        """Genera una guida interattiva condizionata basata sull'analisi AI"""
+        if not self.ai_analysis:
+            return ""
+        
+        analysis = self.ai_analysis
+        risk_level = analysis.get("livello_rischio", "SCONOSCIUTO").upper()
+        
+        # Colori basati su risk level
+        risk_color_map = {
+            "ALTO": "#d32f2f",      # Rosso
+            "MEDIO": "#f57c00",     # Arancione
+            "BASSO": "#388e3c"      # Verde
+        }
+        risk_emoji_map = {
+            "ALTO": "🔴",
+            "MEDIO": "🟠",
+            "BASSO": "🟢"
+        }
+        
+        risk_color = risk_color_map.get(risk_level, "#9c27b0")
+        risk_emoji = risk_emoji_map.get(risk_level, "❓")
+        
+        # Inizio della guida
+        html = f"""
+<div style="font-family: Arial, sans-serif; margin-top: 30px; border-top: 2px solid #ddd; padding-top: 20px;">
+    
+    <h3 style="color: #333;">📋 GUIDA ALL'AGGIORNAMENTO</h3>
+    
+    <!-- Risk Assessment -->
+    <div style="background-color: {risk_color}; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+        <h4 style="margin: 0 0 10px 0;">{risk_emoji} LIVELLO RISCHIO: {risk_level}</h4>
+        <p style="margin: 0; font-size: 14px;">Raccomandazione: <strong>{analysis.get('raccomandazione', 'N/A').upper()}</strong></p>
+    </div>
+    
+    <!-- Versioni Cambiate -->
+"""
+        
+        versioni = analysis.get("versioni_cambiate", [])
+        if versioni:
+            html += """
+    <div style="margin-bottom: 20px;">
+        <h4 style="color: #1976d2; margin-bottom: 10px;">📦 VERSIONI CAMBIATE</h4>
+        <ul style="background-color: #f5f5f5; padding: 15px 30px; border-left: 4px solid #1976d2; border-radius: 4px;">
+"""
+            for version in versioni:
+                html += f"<li style='margin-bottom: 8px;'><code>{version}</code></li>\n"
+            html += "</ul></div>\n"
+        
+        # Variabili Modificate
+        var_modificate = analysis.get("variabili_env_modificate", [])
+        if var_modificate:
+            html += """
+    <div style="margin-bottom: 20px;">
+        <h4 style="color: #1976d2; margin-bottom: 10px;">⚙️ VARIABILI D'AMBIENTE MODIFICATE</h4>
+        <table style="width: 100%; border-collapse: collapse; background-color: #f5f5f5;">
+            <thead>
+                <tr style="background-color: #1976d2; color: white;">
+                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Variabile</th>
+                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Prima</th>
+                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Dopo</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+            for var in var_modificate:
+                # Prova a parsare il formato "VAR: old -> new"
+                parts = var.split(" -> ")
+                if len(parts) == 2:
+                    before = parts[0].split(": ")[-1]
+                    after = parts[1]
+                    var_name = var.split(":")[0] if ":" in var else var.split(" ->")[0]
+                    html += f"""
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><code>{var_name}</code></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><code>{before}</code></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><code style="color: #d32f2f; font-weight: bold;">{after}</code></td>
+                </tr>
+"""
+            html += """
+            </tbody>
+        </table>
+    </div>
+"""
+        
+        # Breaking Changes
+        breaking = analysis.get("breaking_changes", [])
+        if breaking:
+            html += """
+    <div style="margin-bottom: 20px;">
+        <h4 style="color: #d32f2f; margin-bottom: 10px;">🚨 BREAKING CHANGES - ATTENZIONE!</h4>
+        <div style="background-color: #ffebee; border-left: 4px solid #d32f2f; padding: 15px; border-radius: 4px;">
+"""
+            for change in breaking:
+                html += f"<p style='margin: 8px 0;'>⚠️ {change}</p>\n"
+            html += "</div></div>\n"
+        
+        # Migrazioni Necessarie
+        migrazioni = analysis.get("migrazioni_necessarie", [])
+        if migrazioni:
+            html += """
+    <div style="margin-bottom: 20px;">
+        <h4 style="color: #f57c00; margin-bottom: 10px;">✅ AZIONI NECESSARIE (CHECKLIST)</h4>
+        <div style="background-color: #fff3e0; border-left: 4px solid #f57c00; padding: 15px; border-radius: 4px;">
+"""
+            for i, migrazione in enumerate(migrazioni, 1):
+                html += f"""
+            <div style="margin-bottom: 10px; display: flex; align-items: start;">
+                <input type="checkbox" style="margin-right: 10px; margin-top: 2px; cursor: pointer;" id="step{i}">
+                <label for="step{i}" style="cursor: pointer; flex-grow: 1;">{migrazione}</label>
+            </div>
+"""
+            html += "</div></div>\n"
+        
+        # Guida Condizionata Step-by-Step
+        html += """
+    <div style="margin-bottom: 20px;">
+        <h4 style="color: #388e3c; margin-bottom: 10px;">🚀 GUIDA STEP-BY-STEP</h4>
+        <div style="background-color: #f1f8e9; border-left: 4px solid #388e3c; padding: 15px; border-radius: 4px;">
+            <ol style="margin: 0; padding-left: 20px;">
+"""
+        
+        # Step condizionati
+        if var_modificate:
+            html += """
+                <li style="margin-bottom: 12px;">
+                    <strong>Aggiorna il file .env</strong><br>
+                    <span style="color: #666; font-size: 12px;">Le seguenti variabili devono essere aggiornate o aggiunte:</span>
+                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
+"""
+            for var in var_modificate:
+                if "${" in var:  # Nuove variabili da ambiente
+                    var_name = var.split("(")[0].strip() if "(" in var else var
+                    html += f"# Aggiungi: {var_name}=valore_qui\n"
+            html += """
+                    </pre>
+                </li>
+"""
+        
+        if breaking:
+            html += """
+                <li style="margin-bottom: 12px;">
+                    <strong>Backup della configurazione attuale</strong><br>
+                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
+cp docker-compose.yml docker-compose.yml.bak
+cp .env .env.bak
+                    </pre>
+                </li>
+"""
+        
+        html += """
+                <li style="margin-bottom: 12px;">
+                    <strong>Scarica le nuove immagini</strong><br>
+                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
+docker compose pull
+                    </pre>
+                </li>
+                
+                <li style="margin-bottom: 12px;">
+                    <strong>Verifica la configurazione</strong><br>
+                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
+docker compose config --quiet
+                    </pre>
+                </li>
+                
+                <li style="margin-bottom: 12px;">
+                    <strong>Avvia i nuovi container</strong><br>
+                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
+docker compose down
+docker compose up -d
+                    </pre>
+                </li>
+                
+                <li style="margin-bottom: 12px;">
+                    <strong>Verifica lo stato</strong><br>
+                    <pre style="background-color: #e8f5e9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; font-size: 12px;">
+docker compose ps
+docker compose logs -f --tail=50
+                    </pre>
+                </li>
+            </ol>
+        </div>
+    </div>
+"""
+        
+        # Prompt per Copilot Agent
+        html += """
+    <div style="margin-bottom: 20px;">
+        <h4 style="color: #6a1b9a; margin-bottom: 10px;">🤖 PROMPT PER AUTOMAZIONE (Copilot Agent)</h4>
+        <details style="background-color: #f3e5f5; border-left: 4px solid #6a1b9a; padding: 15px; border-radius: 4px; cursor: pointer;">
+            <summary style="font-weight: bold; cursor: pointer;">Clicca per espandere il prompt da usare con Copilot Agent</summary>
+            <pre style="background-color: #ede7f6; padding: 12px; border-radius: 4px; overflow-x: auto; margin-top: 10px; font-size: 11px; white-space: pre-wrap; word-wrap: break-word;">
+"""
+        
+        # Generazione del prompt per l'agente
+        agent_prompt = self._generate_agent_prompt(analysis)
+        html += agent_prompt.replace("<", "&lt;").replace(">", "&gt;")
+        
+        html += """
+            </pre>
+        </details>
+    </div>
+
+</div>
+"""
+        
+        return html
+
+    def _generate_agent_prompt(self, analysis: Dict) -> str:
+        """Genera un prompt strutturato per Copilot Agent per automatizzare la migrazione"""
+        
+        versioni = analysis.get("versioni_cambiate", [])
+        var_modificate = analysis.get("variabili_env_modificate", [])
+        breaking = analysis.get("breaking_changes", [])
+        migrazioni = analysis.get("migrazioni_necessarie", [])
+        risk = analysis.get("livello_rischio", "MEDIO")
+        
+        prompt = f"""
+## Supabase Self-Hosted Update Automation
+
+Devo eseguire un aggiornamento di Supabase Self-Hosted dal mio ambiente di produzione.
+
+### Contesto
+- **Livello di Rischio**: {risk}
+- **Repository**: nik2208/supabase-update-monitor
+- **Ambiente**: Produzione
+
+### Cambiamenti Rilevati
+
+**Versioni Cambiate:**
+{chr(10).join(f"- {v}" for v in versioni)}
+
+**Variabili Modificate:**
+{chr(10).join(f"- {v}" for v in var_modificate)}
+
+**Breaking Changes:**
+{chr(10).join(f"- {b}" for b in breaking)}
+
+### Azioni Richieste
+
+1. **Backup**: Crea un backup della configurazione attuale (docker-compose.yml, .env)
+2. **Aggiornamento variabili .env**: Aggiorna/aggiungi le seguenti variabili:
+   {chr(10).join(f'   - {v.split(":")[0]}' for v in var_modificate)}
+3. **Update container**: 
+   - docker compose pull
+   - docker compose down
+   - docker compose up -d
+4. **Verifiche post-update**:
+   - Verifica che tutti i container siano running
+   - Controlla i log per errori
+   - Verifica la connettività ai servizi principali
+5. **Test funzionali**: Valida che i servizi critici (auth, API, storage) funzionino correttamente
+
+### Attenzioni Importanti
+
+{chr(10).join(f"- {b}" for b in breaking)}
+
+**Aiutami a:**
+- Creare uno script bash automatizzato per questi step
+- Implementare controlli di salute (healthchecks) per validare l'aggiornamento
+- Generare un rollback plan nel caso qualcosa fallisca
+"""
+        
+        return prompt
+
     def send_email(self):
         """Invia email con i risultati"""
         if not MAIL_TO or not SMTP_USER:
@@ -434,16 +699,9 @@ Rispondi con esattamente questo JSON:
             else:
                 html_content += "<p>✅ File .env allineato con .env.example</p>"
 
-            html_content += """
-                <h3>🤖 Analisi AI:</h3>
-            """
-
+            # Sezione Analisi AI con guida interattiva
             if self.ai_analysis:
-                html_content += f"""
-                <pre style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; overflow-x: auto;">
-{json.dumps(self.ai_analysis, indent=2, ensure_ascii=False)}
-                </pre>
-                """
+                html_content += self._build_migration_guide()
             else:
                 html_content += "<p>⚠️ Analisi AI non disponibile</p>"
 
