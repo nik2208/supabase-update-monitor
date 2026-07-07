@@ -1,0 +1,12 @@
+services:
+  monitor:
+    build: .
+    env_file: .env
+    environment:
+      - STATE_DIR=/root/.supabase_monitor
+      - COMPOSE_DIR=/compose
+    volumes:
+      - ${COMPOSE_DIR:-./compose}:/compose:ro
+      - ~/.supabase_monitor:/root/.supabase_monitor
+    profiles:
+      - manual

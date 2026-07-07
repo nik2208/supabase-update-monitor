@@ -1,100 +1,110 @@
 # Supabase Self-Hosted Update Monitor
 
-Sistema automatico di monitoraggio degli aggiornamenti per Supabase self-hosted. Confronta i `docker-compose.yml` locali con il repo GitHub ufficiale, analizza i cambiamenti via AI e invia notifiche email con runbook dettagliata.
+Monitor your local Supabase self-hosted deployment against the latest `master` branch on GitHub. Detects image version changes, new/removed environment variables, and generates detailed reports with AI-powered analysis.
 
-## Requisiti
+## How It Works
 
-- Python 3.7+
-- `requests`, `pyyaml` (vedi `requirements.txt`)
-- (Opzionale) LiteLLM API per analisi AI
-- (Opzionale) Account SMTP per notifiche email
+1. Reads your local `docker-compose*.yml` files and `.env`
+2. Fetches the corresponding files from `github.com/supabase/supabase`
+3. Compares service image versions, environment variables, and file contents
+4. Retrieves the real commit history between your deployed version and the latest GitHub version (scoped to `docker/` directory)
+5. Sends an HTML email with a runbook (optional, requires SMTP)
+6. Saves a markdown report to disk
 
-## File Installati
+## Quick Start
 
-- `/home/docker/github/supabase-monitor/supabase_monitor.py` - Script principale Python
-- `/home/docker/github/supabase-monitor/supabase-monitor.sh` - Script wrapper bash per cron
-- `/home/docker/github/supabase-monitor/.env.supabase-monitor` - File di configurazione
-
-## Installazione e Configurazione
-
-### 1. Configurare il file `.env.supabase-monitor`
+### Native (Python 3.11+)
 
 ```bash
-nano /home/docker/github/supabase-monitor/.env.supabase-monitor
+# 1. Setup
+cp .env.example .env
+# edit .env with your paths and credentials
+
+# 2. Create virtual environment and install dependencies
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+# 3. Run
+bash supabase-monitor.sh
 ```
 
-#### LITELLM (Opzionale - per analisi AI):
-```bash
-export LITELLM_BASE_URL="http://localhost:4000"
-export LITELLM_API_KEY="sk-..."  # Sostituisci con la tua API key
-export LITELLM_MODEL="groq/llama-3.3-70b-versatile"
-```
-
-#### SMTP (Opzionale - per notifiche email):
-```bash
-export SMTP_SERVER="smtp.gmail.com"
-export SMTP_PORT="587"
-export SMTP_USER="tua-email@gmail.com"
-export SMTP_PASSWORD="app-password-generato"
-export MAIL_FROM="tua-email@gmail.com"
-export MAIL_TO="destinatario@example.com,altro@example.com"
-```
-
-### 2. Test manuale
+### Docker (no Python required)
 
 ```bash
-cd /home/docker/github/supabase-monitor
-source .env.supabase-monitor
-/usr/bin/python3 supabase_monitor.py
+# 1. Setup
+cp .env.example .env
+# edit .env with your paths and credentials
+
+# 2. Build and run
+docker compose run --rm monitor
 ```
 
-### 3. Configurare Cron
+> The Docker image uses `python:3.11-slim`. On first run it builds automatically via `docker compose`.
 
-```bash
-crontab -e
-```
+## Configuration
 
-Esempi di schedule:
+All configuration is done through environment variables in `.env`:
 
-```bash
-# Ogni giorno alle 2:00 AM
-0 2 * * * /home/docker/github/supabase-monitor/supabase-monitor.sh
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `COMPOSE_DIR` | **yes** | — | Directory containing your local `docker-compose*.yml` files |
+| `GIT_REPO_DIR` | **yes** | — | Path to a local clone of `github.com/supabase/supabase` (used to extract the `docker/` commit SHA) |
+| `STATE_DIR` | no | `~/.supabase_monitor` | Directory for state file and markdown reports |
+| `LOG_FILE` | no | `./supabase-monitor.log` | Path to the log file |
+| `LITELLM_BASE_URL` | no | — | Base URL for LiteLLM (AI analysis) |
+| `LITELLM_API_KEY` | no | — | API key for LiteLLM (if empty, AI analysis is skipped) |
+| `LITELLM_MODEL` | no | `groq/llama-3.3-70b-versatile` | LLM model for analysis |
+| `SMTP_SERVER` | no | — | SMTP server hostname (if empty, email is skipped) |
+| `SMTP_PORT` | no | `587` | SMTP port |
+| `SMTP_USER` | no | — | SMTP username |
+| `SMTP_PASSWORD` | no | — | SMTP password |
+| `MAIL_FROM` | no | — | Sender email address |
+| `MAIL_TO` | no | — | Recipient email address (comma-separated) |
 
-# Ogni lunedì alle 8:00 AM
-0 8 * * 1 /home/docker/github/supabase-monitor/supabase-monitor.sh
-```
+### Docker-specific notes
 
-## Output e Log
+When running via Docker:
 
-### File di Log:
-```bash
-tail -f /tmp/supabase-monitor.log
-```
+- `COMPOSE_DIR` is mounted at `/compose` inside the container. The path in `.env` points to your **host** directory; `docker-compose.yml` passes it as a bind mount.
+- `STATE_DIR` defaults to `/root/.supabase_monitor` inside the container, mounted from `~/.supabase_monitor` on the host.
+- `GIT_REPO_DIR` is **not used inside Docker** — the container cannot run `git` commands. The commit SHA comparison falls back to the saved state from the previous run.
+- Logs are written to stdout and captured by `docker logs`.
 
-## Come Funziona
+## Output
 
-1. **Lettura file locali**: Carica `docker-compose.yml`, `docker-compose.s3.yml` e `.env`
-2. **Download da GitHub**: Scarica gli stessi file dal repo ufficiale supabase/supabase (master)
-3. **Confronto strutturato**: Genera diff testuali e confronta versione per versione ogni servizio
-4. **Git Compare API**: Recupera i commit reali tra la versione deployata e quella disponibile
-5. **Analisi AI** (opzionale): Invia i cambiamenti a LiteLLM per valutare rischio e generare raccomandazioni
-6. **Generazione runbook**: Crea una guida passo-passo HTML per l'aggiornamento manuale
-7. **Notifica email** (opzionale): Invia la runbook via email
-8. **Salva stato**: Memorizza gli SHA dei file per il confronto successivo
+### Markdown Report
 
-## Cosa Viene Monitorato
+Saved to `$STATE_DIR/reports/YYYY-MM-DD_HH-MM-SS_report.md`. Contains:
 
-- `docker-compose.yml` - Versioni immagini di tutti i servizi Supabase
-- `docker-compose.s3.yml` - Versioni immagini servizi S3 (se presente)
-- `.env` vs `.env.example` - Nuove variabili d'ambiente richieste o rimosse
-- Commit reali tra versione deployata e master via GitHub Compare API
-- Changelog ufficiale da GitHub
+- Metadata (date, status, SHAs)
+- Service version changes
+- Full diff of all `docker-compose*.yml` files
+- Environment variable changes (new and removed)
+- .env diff (keys only, never values)
+- Real commit history between deployed and available versions
+- AI analysis (if configured) with risk level, breaking changes, and migration steps
+- Operating procedure checklist
 
-## Sicurezza
+### Email (optional)
 
-- Le credenziali sono nel file `.env.supabase-monitor`, NON nel codice Python
-- Usa permission restrittive: `chmod 600 /home/docker/github/supabase-monitor/.env.supabase-monitor`
+If SMTP is configured, an HTML email with the same information is sent to the recipients.
 
----
+## Dependencies
 
-**Ultima modifica**: 2026-07-05
+- Python 3.11+
+- `pyyaml>=6.0`
+- `requests>=2.28`
+
+Or simply Docker.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `supabase_monitor.py` | Main monitoring script |
+| `supabase-monitor.sh` | Wrapper script for native execution (sources `.env`, manages venv) |
+| `.env.example` | Template for configuration |
+| `Dockerfile` | Container image definition |
+| `docker-compose.yml` | Docker Compose service for `docker compose run` |
+| `requirements.txt` | Python dependencies |
+| `supabase-monitor.log` | Execution log (native mode) |
