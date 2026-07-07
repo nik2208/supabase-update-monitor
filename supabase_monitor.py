@@ -20,12 +20,15 @@ from email.mime.multipart import MIMEMultipart
 import requests
 from pathlib import Path
 
+VERSION = "4"
+
 # === CONFIGURAZIONE ===
 # File locali
 COMPOSE_DIR = os.getenv("COMPOSE_DIR", "/home/docker/dockerCompose/supabase/supatest")
-COMPOSE_FILE = os.path.join(COMPOSE_DIR, "docker-compose.yml")
-COMPOSE_S3_FILE = os.path.join(COMPOSE_DIR, "docker-compose.s3.yml")
 ENV_FILE = os.path.join(COMPOSE_DIR, ".env")
+
+# Git repo del clone Supabase (contiene .git con la storia di docker/)
+GIT_REPO_DIR = os.getenv("GIT_REPO_DIR", "/home/docker/dockerCompose/supabase/supabase")
 
 # GitHub URLs
 GITHUB_COMPOSE_URL = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/docker-compose.yml"
@@ -56,20 +59,18 @@ MAIL_TO = [x.strip() for x in os.getenv("MAIL_TO", "").split(",") if x.strip()]
 # State e log
 STATE_DIR = os.getenv("STATE_DIR", os.path.expanduser("~/.supabase_monitor"))
 STATE_FILE = os.path.join(STATE_DIR, "version_info.json")
-LOG_FILE = os.getenv("LOG_FILE", "/var/log/supabase-monitor.log")
+LOG_FILE = os.getenv("LOG_FILE", "/tmp/supabase-monitor.log")
 CHANGELOG_EXTRACT_SIZE = 100
+REPORT_DIR = os.path.join(STATE_DIR, "reports")
 
 
 class SupabaseMonitor:
     def __init__(self):
-        self.local_compose = ""
-        self.local_compose_s3 = ""
-        self.github_compose = ""
-        self.github_compose_s3 = ""
+        self.local_compose_files: Dict[str, str] = {}
+        self.github_compose_files: Dict[str, str] = {}
+        self.compose_diffs: Dict[str, str] = {}
         self.local_env = ""
         self.github_env_example = ""
-        self.compose_diff = ""
-        self.compose_s3_diff = ""
         self.env_diff = ""
         self.changelog_excerpt = ""
         self.ai_analysis = None
@@ -85,6 +86,8 @@ class SupabaseMonitor:
         self.current_version_info = {}
         self.github_commit_sha = ""
         self.github_commit_sha_full = ""
+        self.github_docker_commit_sha = ""
+        self.github_docker_commit_sha_full = ""
         self.github_latest_tag = ""
         self.relevant_changelog = ""  # commit reali tra versione deployata e attuale
 
@@ -103,8 +106,12 @@ class SupabaseMonitor:
         if not os.path.exists(COMPOSE_DIR):
             raise FileNotFoundError(f"Directory non trovata: {COMPOSE_DIR}")
 
-        if not os.path.exists(COMPOSE_FILE):
-            raise FileNotFoundError(f"docker-compose.yml non trovato: {COMPOSE_FILE}")
+        compose_files = [f for f in os.listdir(COMPOSE_DIR)
+                         if f.startswith("docker-compose") and f.endswith(".yml")]
+        if not compose_files:
+            raise FileNotFoundError(
+                f"Nessun docker-compose*.yml trovato in {COMPOSE_DIR}"
+            )
 
         if not os.path.exists(ENV_FILE):
             print(f"  ⚠️  .env non trovato: {ENV_FILE}")
@@ -123,43 +130,50 @@ class SupabaseMonitor:
 
         print(f"  ✓ Configurazione validata")
 
-    def _get_file_hash(self, filepath: str) -> str:
-        """Calcola SHA256 di un file"""
+    def _get_compose_files_sha(self) -> str:
+        """Calcola SHA256 aggregato di tutti i docker-compose*.yml in COMPOSE_DIR"""
         import hashlib
+        hasher = hashlib.sha256()
         try:
-            with open(filepath, 'rb') as f:
-                return hashlib.sha256(f.read()).hexdigest()[:16]
+            for fname in sorted(os.listdir(COMPOSE_DIR)):
+                if fname.startswith("docker-compose") and fname.endswith(".yml"):
+                    fpath = os.path.join(COMPOSE_DIR, fname)
+                    with open(fpath, 'rb') as f:
+                        hasher.update(f.read())
+            return hasher.hexdigest()[:16]
         except:
             return "unknown"
 
     def _get_git_commit_sha(self) -> str:
-        """Estrae il commit SHA dal repo locale (se esiste)"""
+        """Estrae lo SHA (16 char) dell'ultimo commit che ha toccato docker/
+        nel clone Supabase (GIT_REPO_DIR)."""
         try:
             result = subprocess.run(
-                ['git', 'rev-parse', 'HEAD'],
-                cwd=COMPOSE_DIR,
+                ['git', 'log', '-1', '--format=%H', '--', 'docker/'],
+                cwd=GIT_REPO_DIR,
                 capture_output=True,
                 text=True,
                 timeout=5
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()[:16]
         except:
             pass
         return "unknown"
 
     def _get_git_commit_sha_full(self) -> str:
-        """Estrae lo SHA completo (40 char) del repo locale, necessario per
-        chiamare la GitHub Compare API (lo SHA troncato a 16 char non basta)."""
+        """Estrae lo SHA completo (40 char) dell'ultimo commit che ha toccato
+        docker/ nel clone Supabase (GIT_REPO_DIR), necessario per chiamare la
+        GitHub Compare API (lo SHA troncato a 16 char non basta)."""
         try:
             result = subprocess.run(
-                ['git', 'rev-parse', 'HEAD'],
-                cwd=COMPOSE_DIR,
+                ['git', 'log', '-1', '--format=%H', '--', 'docker/'],
+                cwd=GIT_REPO_DIR,
                 capture_output=True,
                 text=True,
                 timeout=5
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
         except:
             pass
@@ -182,17 +196,19 @@ class SupabaseMonitor:
             self.current_version_info = {}
 
     def _load_local_compose(self):
-        """Carica i docker-compose.yml e .env locali"""
+        """Carica TUTTI i docker-compose*.yml e .env locali (scoperta dinamica)"""
         print(f"\n[{datetime.now()}] Caricando file locali...")
 
-        with open(COMPOSE_FILE) as f:
-            self.local_compose = f.read()
-        print(f"  ✓ {COMPOSE_FILE}")
+        self.local_compose_files = {}
+        for fname in sorted(os.listdir(COMPOSE_DIR)):
+            if fname.startswith("docker-compose") and fname.endswith(".yml"):
+                fpath = os.path.join(COMPOSE_DIR, fname)
+                with open(fpath) as f:
+                    self.local_compose_files[fname] = f.read()
+                print(f"  ✓ {fpath}")
 
-        if os.path.exists(COMPOSE_S3_FILE):
-            with open(COMPOSE_S3_FILE) as f:
-                self.local_compose_s3 = f.read()
-            print(f"  ✓ {COMPOSE_S3_FILE}")
+        if not self.local_compose_files:
+            print(f"  ⚠️  Nessun docker-compose*.yml trovato in {COMPOSE_DIR}")
 
         if os.path.exists(ENV_FILE):
             with open(ENV_FILE) as f:
@@ -202,28 +218,51 @@ class SupabaseMonitor:
             print(f"  ⚠️  .env non trovato in {ENV_FILE}")
 
     def _fetch_github_compose(self):
-        """Scarica i docker-compose.yml e .env.example dal repo GitHub"""
+        """Scarica TUTTI i docker-compose*.yml da GitHub e .env.example.
+        Scopre dinamicamente la lista dei compose dal repo."""
         print(f"\n[{datetime.now()}] Scaricando file da GitHub...")
 
-        try:
-            resp = requests.get(GITHUB_COMPOSE_URL, timeout=10)
-            resp.raise_for_status()
-            self.github_compose = resp.text
-            print(f"  ✓ docker-compose.yml")
-        except Exception as e:
-            msg = f"Errore scaricando docker-compose.yml: {e}"
-            print(f"  ✗ {msg}")
-            self.errors.append(msg)
-            return False
+        gh_headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
+        # Scopri i file compose disponibili su GitHub
         try:
-            resp = requests.get(GITHUB_COMPOSE_S3_URL, timeout=10)
+            resp = requests.get(
+                "https://api.github.com/repos/supabase/supabase/contents/docker",
+                headers=gh_headers, timeout=10
+            )
             resp.raise_for_status()
-            self.github_compose_s3 = resp.text
-            print(f"  ✓ docker-compose.s3.yml")
+            gh_files = resp.json()
+            gh_compose_names = set(
+                item["name"] for item in gh_files
+                if isinstance(item, dict)
+                and item["name"].startswith("docker-compose")
+                and item["name"].endswith(".yml")
+                and item["type"] == "file"
+            )
         except Exception as e:
-            print(f"  ⚠️  Errore scaricando docker-compose.s3.yml: {e}")
+            print(f"  ⚠️  Errore listando file da GitHub: {e}")
+            gh_compose_names = set()
 
+        # Scarica TUTTI i compose disponibili su GitHub (unione: sia nuovi
+        # che quelli in comune con locale — quelli solo locali verranno
+        # gestiti come "rimossi da GitHub" dal loop in compare())
+        to_fetch = set(self.local_compose_files.keys()) | gh_compose_names
+
+        if not to_fetch:
+            print(f"  ⚠️  Nessun docker-compose*.yml in comune tra locale e GitHub")
+            self.github_compose_files = {}
+        else:
+            for fname in sorted(to_fetch):
+                url = f"https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/docker/{fname}"
+                try:
+                    resp = requests.get(url, timeout=10)
+                    resp.raise_for_status()
+                    self.github_compose_files[fname] = resp.text
+                    print(f"  ✓ {fname}")
+                except Exception as e:
+                    print(f"  ⚠️  Errore scaricando {fname}: {e}")
+
+        # Scarica .env.example
         try:
             resp = requests.get(GITHUB_ENV_EXAMPLE_URL, timeout=10)
             resp.raise_for_status()
@@ -233,7 +272,6 @@ class SupabaseMonitor:
             print(f"  ⚠️  Errore scaricando .env.example: {e}")
 
         # Estrai commit SHA dal repo GitHub
-        gh_headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
         try:
             resp = requests.get(f"{GITHUB_API_COMMITS}?per_page=1&sha=master", headers=gh_headers, timeout=10)
             resp.raise_for_status()
@@ -241,10 +279,26 @@ class SupabaseMonitor:
             if commits:
                 self.github_commit_sha_full = commits[0]['sha']
                 self.github_commit_sha = self.github_commit_sha_full[:16]
-                print(f"  ✓ GitHub commit: {self.github_commit_sha}")
+                print(f"  ✓ GitHub HEAD: {self.github_commit_sha}")
         except Exception as e:
             print(f"  ⚠️  Errore ricevendo commit SHA: {e}")
             self.github_commit_sha = "unknown"
+
+        # Estrai l'ultimo commit su GitHub che ha toccato docker/
+        try:
+            resp = requests.get(
+                f"{GITHUB_API_COMMITS}?per_page=1&sha=master&path=docker/",
+                headers=gh_headers, timeout=10
+            )
+            resp.raise_for_status()
+            docker_commits = resp.json()
+            if docker_commits:
+                self.github_docker_commit_sha_full = docker_commits[0]['sha']
+                self.github_docker_commit_sha = self.github_docker_commit_sha_full[:16]
+                print(f"  ✓ GitHub docker/ commit: {self.github_docker_commit_sha}")
+        except Exception as e:
+            print(f"  ⚠️  Errore ricevendo docker/ commit SHA: {e}")
+            self.github_docker_commit_sha = "unknown"
 
         return True
 
@@ -324,12 +378,10 @@ class SupabaseMonitor:
         return nuove, rimosse
 
     def _fetch_commits_between(self, base_sha: str, head_sha: str) -> str:
-        """Usa la GitHub Compare API per ottenere l'elenco REALE dei commit
+        """Usa la GitHub Compare API per ottenere l'elenco dei commit
         tra la versione attualmente deployata (base) e quella disponibile
-        su master (head). A differenza dell'estratto statico di
-        CHANGELOG.md, questo è sempre esattamente delimitato al periodo
-        rilevante, indipendentemente da quanto tempo sia passato dall'ultimo
-        aggiornamento.
+        su master (head). Entrambe le SHA puntano all'ultimo commit che ha
+        toccato docker/, quindi tutti i commit nel range sono rilevanti.
 
         NOTA: richiede SHA completi (40 caratteri), non troncati.
         Ritorna stringa vuota se non applicabile (es. prima esecuzione,
@@ -350,20 +402,11 @@ class SupabaseMonitor:
 
         total_commits = data.get("total_commits", 0)
         commits = data.get("commits", [])
-        files = data.get("files", [])
 
-        # Filtra solo i file sotto docker/ per capire se il range di commit
-        # tocca effettivamente la parte self-hosted che ci interessa
-        docker_files = [f["filename"] for f in files if f.get("filename", "").startswith("docker/")]
+        lines = [
+            f"Commit tra {base_sha[:10]} (docker/ locale) e {head_sha[:10]} (docker/ GitHub): {total_commits} totali"
+        ]
 
-        lines = [f"Commit reali tra {base_sha[:10]} (deployato) e {head_sha[:10]} (disponibile): {total_commits} totali"]
-
-        if docker_files:
-            lines.append(f"File sotto docker/ toccati in questo range: {', '.join(docker_files[:30])}")
-        else:
-            lines.append("Nessun file sotto docker/ toccato in questo range (probabile falso positivo nel confronto compose)")
-
-        # Messaggi di commit (solo prima riga, per restare compatti)
         for c in commits[:50]:
             msg = c.get("commit", {}).get("message", "").split("\n")[0].strip()
             sha_short = c.get("sha", "")[:10]
@@ -374,7 +417,7 @@ class SupabaseMonitor:
             lines.append(f"... e altri {total_commits - 50} commit non mostrati (troppi per il prompt)")
 
         result = "\n".join(lines)
-        print(f"  ✓ Compare API: {total_commits} commit, {len(docker_files)} file docker/ toccati")
+        print(f"  ✓ Compare API: {total_commits} commit")
         return result
 
     def _fetch_changelog(self) -> str:
@@ -395,7 +438,7 @@ class SupabaseMonitor:
             return ""
 
     def compare(self) -> bool:
-        """Esegui il confronto tra i file"""
+        """Esegui il confronto tra TUTTI i file compose locali e GitHub"""
         self._load_current_version()
         self._load_local_compose()
 
@@ -404,17 +447,13 @@ class SupabaseMonitor:
 
         print(f"\n[{datetime.now()}] Generando diff testuale...")
 
-        self.compose_diff = self._generate_diff(
-            self.local_compose,
-            self.github_compose,
-            "docker-compose.yml"
-        )
-
-        if self.local_compose_s3:
-            self.compose_s3_diff = self._generate_diff(
-                self.local_compose_s3,
-                self.github_compose_s3,
-                "docker-compose.s3.yml"
+        self.compose_diffs = {}
+        all_names = sorted(set(self.local_compose_files) | set(self.github_compose_files))
+        for fname in all_names:
+            local_content = self.local_compose_files.get(fname, "")
+            github_content = self.github_compose_files.get(fname, "")
+            self.compose_diffs[fname] = self._generate_diff(
+                local_content, github_content, fname
             )
 
         if self.local_env and self.github_env_example:
@@ -426,14 +465,12 @@ class SupabaseMonitor:
 
         print(f"\n[{datetime.now()}] Generando confronto strutturato (versioni servizi + variabili env)...")
 
-        # Confronto strutturato: elabora TUTTI i servizi/variabili, senza
-        # alcun limite di dimensione, a differenza del diff testuale grezzo.
-        self.service_version_changes = self._diff_service_versions(
-            self.local_compose, self.github_compose
-        )
-        if self.local_compose_s3 and self.github_compose_s3:
+        self.service_version_changes = []
+        for fname in all_names:
+            local_content = self.local_compose_files.get(fname, "")
+            github_content = self.github_compose_files.get(fname, "")
             self.service_version_changes += self._diff_service_versions(
-                self.local_compose_s3, self.github_compose_s3
+                local_content, github_content
             )
 
         if self.local_env and self.github_env_example:
@@ -453,8 +490,7 @@ class SupabaseMonitor:
             print(f"  ✓ {len(self.env_vars_rimosse)} variabili env rimosse/deprecate")
 
         self.has_changes = (
-            "Nessuna differenza" not in self.compose_diff or
-            (self.compose_s3_diff and "Nessuna differenza" not in self.compose_s3_diff) or
+            any("Nessuna differenza" not in d for d in self.compose_diffs.values()) or
             (self.env_diff and "Nessuna differenza" not in self.env_diff) or
             bool(self.service_version_changes) or
             bool(self.env_vars_nuove) or
@@ -467,13 +503,14 @@ class SupabaseMonitor:
             print(f"  ✓ File allineati con GitHub")
 
         # Recupera il changelog REALE (commit veri) tra la versione deployata
-        # nell'esecuzione precedente e quella disponibile ora. Preferito
-        # rispetto all'estratto statico di CHANGELOG.md perché è sempre
-        # esattamente delimitato al periodo che interessa.
+        # e quella disponibile ora. Il confronto è tra l'ultimo commit che ha
+        # toccato docker/ nel clone locale e l'ultimo commit che ha toccato
+        # docker/ su GitHub — così otteniamo SOLO i commit rilevanti per il
+        # self-hosting, non l'intero sviluppo di Supabase.
         if self.has_changes:
-            print(f"\n[{datetime.now()}] Recuperando commit reali da GitHub Compare API...")
-            base_sha_full = self.current_version_info.get("github_commit_full", "")
-            head_sha_full = self.github_commit_sha_full
+            print(f"\n[{datetime.now()}] Recuperando commit reali docker/ da GitHub Compare API...")
+            base_sha_full = self._get_git_commit_sha_full()
+            head_sha_full = self.github_docker_commit_sha_full or self.github_commit_sha_full
             self.relevant_changelog = self._fetch_commits_between(base_sha_full, head_sha_full)
             if not self.relevant_changelog:
                 print(f"  ℹ️  Compare API non disponibile (probabile prima esecuzione), uso estratto statico del CHANGELOG.md")
@@ -501,9 +538,8 @@ class SupabaseMonitor:
             changelog_source_note = "(fonte: estratto statico CHANGELOG.md, non delimitato alla versione deployata)"
 
         # Riassunto strutturato: copre TUTTI i servizi e TUTTE le variabili,
-        # a differenza del vecchio approccio che troncava il diff testuale
-        # grezzo (compose_diff[:2000], compose_s3_diff[:500]) perdendo
-        # tutto ciò che seguiva i primi servizi elencati nel file.
+        # senza limite alla profondità del diff testuale, a differenza del
+        # precedente approccio a singoli file che troncava l'output.
         versioni_summary = "\n".join(self.service_version_changes) if self.service_version_changes else "Nessuna modifica versione immagine rilevata"
         env_summary = (
             f"Nuove variabili richieste: {', '.join(self.env_vars_nuove) if self.env_vars_nuove else 'nessuna'}\n"
@@ -672,7 +708,7 @@ Rispondi con esattamente questo JSON:
     <h1 style="margin: 0 0 20px 0; color: #000;">SUPABASE SELF-HOSTED UPDATE RUNBOOK</h1>
     <p style="margin: 5px 0;"><strong>Data Report:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
     <p style="margin: 5px 0;"><strong>Versione Attuale:</strong> sha={current_sha}</p>
-    <p style="margin: 5px 0;"><strong>Versione Disponibile:</strong> sha={self.github_commit_sha}</p>
+    <p style="margin: 5px 0;"><strong>Versione Disponibile (docker/):</strong> sha={self.github_docker_commit_sha or self.github_commit_sha}</p>
     <p style="margin: 5px 0;"><strong>Git Commit:</strong> {git_sha}</p>
 </div>
 
@@ -973,7 +1009,8 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
     <hr>
     <p style="color: #666; font-size: 12px;">
         Versione Attuale: {self.current_version_info.get('docker_compose_sha', 'unknown')}<br>
-        Versione GitHub: {self.github_commit_sha}
+        Versione GitHub docker/: {self.github_docker_commit_sha or self.github_commit_sha}<br>
+        GitHub HEAD: {self.github_commit_sha}
     </p>
 </body>
 </html>
@@ -997,12 +1034,16 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
         """Salva lo stato della versione corrente"""
         state = {
             "last_update": datetime.now().isoformat(),
-            "docker_compose_sha": self._get_file_hash(COMPOSE_FILE),
+            "compose_files_sha": self._get_compose_files_sha(),
             "git_commit": self._get_git_commit_sha(),
             "github_commit": self.github_commit_sha,
             "github_commit_full": self.github_commit_sha_full,
+            "github_docker_commit": self.github_docker_commit_sha,
+            "github_docker_commit_full": self.github_docker_commit_sha_full,
             "has_changes": self.has_changes,
-            "compose_diff_lines": len(self.compose_diff.split('\n')),
+            "compose_files_diff_lines": sum(
+                len(d.split('\n')) for d in self.compose_diffs.values()
+            ),
             "service_version_changes": self.service_version_changes,
             "env_vars_nuove": self.env_vars_nuove,
             "env_vars_rimosse": self.env_vars_rimosse,
@@ -1023,10 +1064,121 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
             for error in self.errors:
                 print(f"  {error}")
 
+    def _save_report(self):
+        """Salva un report markdown su filesystem con data run."""
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
+        report_path = os.path.join(REPORT_DIR, f"{timestamp}_report.md")
+
+        status = "ALLINEATO" if not self.has_changes else "AGGIORNAMENTI DISPONIBILI"
+        lines = [
+            f"# Supabase Monitor Report",
+            f"",
+            f"- **Data**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- **Stato**: {status}",
+            f"- **Versione locale docker/ (SHA)**: {self._get_git_commit_sha()}",
+            f"- **Versione GitHub docker/ (SHA)**: {self.github_docker_commit_sha or 'N/A'}",
+            f"- **GitHub HEAD (SHA)**: {self.github_commit_sha}",
+            f"",
+        ]
+
+        if self.errors:
+            lines += [f"## Avvisi / Errori", f""]
+            for e in self.errors:
+                lines.append(f"- ⚠️ {e}")
+            lines.append("")
+
+        if self.service_version_changes:
+            lines += [f"## Versioni Cambiate ({len(self.service_version_changes)})", f""]
+            for change in self.service_version_changes:
+                lines.append(f"- {change}")
+            lines.append("")
+
+        if self.compose_diffs:
+            lines += [f"## Diff File Compose", f""]
+            for fname, diff_text in sorted(self.compose_diffs.items()):
+                if diff_text and "Nessuna differenza" not in diff_text:
+                    lines += [f"### {fname}", "", "```diff"]
+                    lines.append(diff_text[:3000])
+                    if len(diff_text) > 3000:
+                        lines.append("... (diff troncato)")
+                    lines += ["```", ""]
+
+        if self.env_vars_nuove:
+            lines += [f"## Nuove Variabili Env ({len(self.env_vars_nuove)})", f""]
+            for v in self.env_vars_nuove:
+                lines.append(f"- `{v}`")
+            lines.append("")
+
+        if self.env_vars_rimosse:
+            lines += [f"## Variabili Env Rimosse ({len(self.env_vars_rimosse)})", f""]
+            for v in self.env_vars_rimosse:
+                lines.append(f"- `{v}`")
+            lines.append("")
+
+        # Changelog: preferisci i commit reali della Compare API, altrimenti
+        # l'estratto statico di CHANGELOG.md
+        changelog_source = self.relevant_changelog or self.changelog_excerpt
+        if changelog_source:
+            label = "Changelog (commit docker/ via GitHub Compare API)" if self.relevant_changelog else "Changelog (estratto statico CHANGELOG.md)"
+            lines += [f"## {label}", "", "```"]
+            lines.append(changelog_source[:3000])
+            lines += ["```", ""]
+
+        if self.env_diff and "Nessuna differenza" not in self.env_diff:
+            lines += [f"## Diff .env", "", "```diff"]
+            lines.append(self.env_diff[:1500])
+            lines += ["```", ""]
+
+        # AI analysis: dump completo JSON + sezioni interpretate
+        if self.ai_analysis:
+            lines += [f"## Analisi AI", f""]
+            lines += [f"- **Rischio**: {self.ai_analysis.get('livello_rischio', 'SCONOSCIUTO')}"]
+            lines.append(f"- **Raccomandazione**: {self.ai_analysis.get('raccomandazione', 'N/A')}")
+            lines.append(f"- **Downtime stimato**: ~{self.ai_analysis.get('stima_downtime_minuti', '?')} minuti")
+            lines.append(f"- **Verdetto**: {self.ai_analysis.get('verdetto_finale', 'N/A')}")
+            lines.append("")
+
+            breaking = self.ai_analysis.get("breaking_changes", [])
+            if breaking:
+                lines += ["### Breaking Changes", ""]
+                for b in breaking:
+                    lines.append(f"- {b}")
+                lines.append("")
+
+            migrazioni = self.ai_analysis.get("migrazioni_necessarie", [])
+            if migrazioni:
+                lines += ["### Migrazioni Necessarie", ""]
+                for m in migrazioni:
+                    lines.append(f"- {m}")
+                lines.append("")
+
+            # Procedura operativa suggerita dall'AI
+            if self.ai_analysis.get("verdetto_finale"):
+                lines += [
+                    f"### Procedura Operativa",
+                    f"",
+                    f"1. **Analizzare le versioni cambiate** sopra elencate",
+                    f"2. **Applicare le nuove variabili d'ambiente** necessarie",
+                    f"3. **Rimuovere le variabili deprecate** dal .env",
+                    f"4. **Eseguire backup** dei dati e del database prima dell'upgrade",
+                    f"5. **Deployare i nuovi container** seguendo l'ordine: db -> servizi di sistema -> servizi applicativi",
+                    f"6. **Verificare lo stato** dei container dopo il deploy",
+                    f"",
+                ]
+
+        content = "\n".join(lines)
+        try:
+            with open(report_path, 'w') as f:
+                f.write(content)
+            print(f"  ✓ Report salvato: {report_path}")
+        except Exception as e:
+            print(f"  ✗ Errore salvando report: {e}")
+
     def run(self):
         """Esegui il ciclo completo"""
         print("=" * 70)
-        print("Supabase Self-Hosted Update Monitor v4")
+        print(f"Supabase Self-Hosted Update Monitor v{VERSION}")
         print("=" * 70)
 
         self.changelog_excerpt = self._fetch_changelog()
@@ -1037,6 +1189,7 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
             return
 
         if not self.has_changes:
+            self._save_report()
             print("\n✓ Configurazione allineata con GitHub master")
             self.print_summary()
             if MAIL_TO and SMTP_USER:
@@ -1047,6 +1200,8 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
         print("\n🔴 AGGIORNAMENTI DISPONIBILI - Generando runbook...")
 
         self.analyze_with_ai()
+
+        self._save_report()
 
         if MAIL_TO and SMTP_USER:
             self.send_email()
@@ -1060,7 +1215,7 @@ $ docker compose exec postgres psql -U postgres -f /path/to/backup.sql
 if __name__ == "__main__":
     try:
         print("=" * 70)
-        print("Supabase Self-Hosted Update Monitor v4")
+        print(f"Supabase Self-Hosted Update Monitor v{VERSION}")
         print("=" * 70)
         print(f"\nConfigurazione:")
         print(f"  COMPOSE_DIR: {COMPOSE_DIR}")
